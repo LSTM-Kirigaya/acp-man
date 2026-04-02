@@ -1,0 +1,43 @@
+{
+  "name": "feishu-bot-messaging",
+  "version": "1.0.0",
+  "description": "抽象飞书消息中间层 - 支持消息发送和接收",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "node --loader ts-node/esm src/test.ts",
+    "test:basic": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm --no-warnings src/scripts/test-feishu-basic.ts",
+    "test:agent": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm --no-warnings src/scripts/test-agent.ts",
+    "diagnose": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm --no-warnings src/scripts/diagnose-feishu.ts",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "watch": "nodemon --exec 'node --loader ts-node/esm' src/index.ts",
+    "acp:example": "node --loader ts-node/esm src/kimi-acp-client/example.ts",
+    "acp:minimal": "node --loader ts-node/esm src/kimi-acp-client/minimal.ts",
+    "agent": "TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm --no-warnings src/feishu-acp-agent/index.ts",
+    "agent:debug": "DEBUG=true TS_NODE_TRANSPILE_ONLY=true node --loader ts-node/esm --no-warnings src/feishu-acp-agent/index.ts"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "bot",
+    "messaging",
+    "kimi",
+    "acp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.18.0",
+    "@larksuiteoapi/node-sdk": "^1.38.0",
+    "axios": "^1.8.4",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.17",
+    "nodemon": "^3.1.9",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  }
+}
