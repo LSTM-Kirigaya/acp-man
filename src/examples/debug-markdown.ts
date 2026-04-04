@@ -35,6 +35,7 @@ if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
 
 /**
  * Markdown 转飞书富文本转换器
+ * 参考: https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message/create
  */
 class MarkdownToFeishuConverter {
     /**
@@ -42,7 +43,7 @@ class MarkdownToFeishuConverter {
      */
     convert(markdown: string): any {
         const lines = markdown.split('\n');
-        const paragraphs: any[][] = [];
+        const content: any[][] = [];
         let i = 0;
 
         while (i < lines.length) {
@@ -56,10 +57,10 @@ class MarkdownToFeishuConverter {
 
             // 一级标题 # Title
             if (line.startsWith('# ') && !line.startsWith('## ')) {
-                paragraphs.push([{
+                content.push([{
                     tag: 'text',
                     text: line.substring(2),
-                    style: { bold: true, fontsize: 3 },
+                    style: { bold: true },
                 }]);
                 i++;
                 continue;
@@ -67,10 +68,10 @@ class MarkdownToFeishuConverter {
 
             // 二级标题 ## Title
             if (line.startsWith('## ') && !line.startsWith('### ')) {
-                paragraphs.push([{
+                content.push([{
                     tag: 'text',
                     text: line.substring(3),
-                    style: { bold: true, fontsize: 2 },
+                    style: { bold: true },
                 }]);
                 i++;
                 continue;
@@ -78,10 +79,10 @@ class MarkdownToFeishuConverter {
 
             // 三级标题 ### Title
             if (line.startsWith('### ')) {
-                paragraphs.push([{
+                content.push([{
                     tag: 'text',
                     text: line.substring(4),
-                    style: { bold: true, fontsize: 1 },
+                    style: { bold: true },
                 }]);
                 i++;
                 continue;
@@ -89,10 +90,9 @@ class MarkdownToFeishuConverter {
 
             // 引用 > text
             if (line.startsWith('> ')) {
-                paragraphs.push([{
+                content.push([{
                     tag: 'text',
                     text: '💡 ' + line.substring(2),
-                    style: { italic: true, bold: false },
                 }]);
                 i++;
                 continue;
@@ -100,7 +100,6 @@ class MarkdownToFeishuConverter {
 
             // 分割线 ---
             if (line === '---' || line === '***') {
-                // 飞书 post 不支持 hr，用空行代替
                 i++;
                 continue;
             }
@@ -109,13 +108,20 @@ class MarkdownToFeishuConverter {
             if (line.includes('|')) {
                 const tableLines: string[] = [];
                 while (i < lines.length && lines[i].trim().includes('|')) {
-                    tableLines.push(lines[i].trim());
+                    const row = lines[i].trim();
+                    // 跳过分隔行 |---|---|
+                    if (!row.match(/^\|[-:\s|]+\|$/)) {
+                        tableLines.push(row);
+                    }
                     i++;
                 }
 
-                const tableContent = this.parseTable(tableLines);
-                if (tableContent) {
-                    paragraphs.push(tableContent);
+                // 简化表格为文本行
+                for (const row of tableLines) {
+                    const cells = row.split('|').map(c => c.trim()).filter(c => c);
+                    if (cells.length > 0) {
+                        content.push(this.parseInlineMarkdown(cells.join('  |  ')));
+                    }
                 }
                 continue;
             }
@@ -126,123 +132,57 @@ class MarkdownToFeishuConverter {
                 const elements = this.parseInlineMarkdown(text);
                 // 添加列表符号
                 elements.unshift({ tag: 'text', text: '• ' });
-                paragraphs.push(elements);
+                content.push(elements);
                 i++;
                 continue;
             }
 
             // 普通段落
-            paragraphs.push(this.parseInlineMarkdown(line));
+            content.push(this.parseInlineMarkdown(line));
             i++;
         }
 
         return {
             zh_cn: {
-                title: '📈 富文本消息测试',
-                content: paragraphs,
+                title: '富文本测试',
+                content: content,
             },
         };
     }
 
     /**
-     * 解析表格
-     */
-    private parseTable(lines: string[]): any[] | null {
-        // 过滤掉分隔行 |---|---|
-        const dataLines = lines.filter(line => !line.match(/^\|[-:\s|]+\|$/));
-        if (dataLines.length === 0) return null;
-
-        const elements: any[] = [];
-
-        // 表头（第一行）
-        const headerLine = dataLines[0];
-        const headers = headerLine.split('|').map(c => c.trim()).filter(c => c);
-        if (headers.length > 0) {
-            elements.push({
-                tag: 'text',
-                text: headers.join('  |  '),
-                style: { bold: true },
-            });
-        }
-
-        // 数据行
-        for (let i = 1; i < dataLines.length; i++) {
-            const cells = dataLines[i].split('|').map(c => c.trim()).filter(c => c);
-            if (cells.length > 0) {
-                // 解析每个单元格的行内 Markdown
-                const cellElements: any[] = [];
-                cells.forEach((cell, index) => {
-                    if (index > 0) {
-                        cellElements.push({ tag: 'text', text: '  |  ' });
-                    }
-                    // 解析单元格内的粗体
-                    const inlineElements = this.parseInlineMarkdown(cell, false);
-                    cellElements.push(...inlineElements);
-                });
-                elements.push(...cellElements);
-            }
-        }
-
-        return elements;
-    }
-
-    /**
      * 解析行内 Markdown（粗体、斜体、代码）
+     * 返回元素数组，每个段落必须是一个数组
      */
-    private parseInlineMarkdown(text: string, addNewline: boolean = true): any[] {
+    private parseInlineMarkdown(text: string): any[] {
         const elements: any[] = [];
-        let remaining = text;
-
-        // 处理 **粗体** 和 *斜体*
-        const pattern = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g;
-        let lastIndex = 0;
-        let match;
-
-        while ((match = pattern.exec(text)) !== null) {
-            // 添加匹配前的普通文本
-            if (match.index > lastIndex) {
+        
+        // 简单的 **粗体** 解析
+        const parts = text.split(/(\*\*[^*]+\*\*)/g);
+        
+        for (const part of parts) {
+            if (part.startsWith('**') && part.endsWith('**')) {
                 elements.push({
                     tag: 'text',
-                    text: text.substring(lastIndex, match.index),
-                });
-            }
-
-            const content = match[0];
-            if (content.startsWith('**') && content.endsWith('**')) {
-                // 粗体
-                elements.push({
-                    tag: 'text',
-                    text: content.slice(2, -2),
+                    text: part.slice(2, -2),
                     style: { bold: true },
                 });
-            } else if (content.startsWith('*') && content.endsWith('*')) {
-                // 斜体
-                elements.push({
-                    tag: 'text',
-                    text: content.slice(1, -1),
-                    style: { italic: true },
-                });
-            } else if (content.startsWith('`') && content.endsWith('`')) {
-                // 代码
-                elements.push({
-                    tag: 'text',
-                    text: content.slice(1, -1),
-                    style: { code: true },
-                });
+            } else if (part) {
+                // 处理行内代码 `code`
+                const codeParts = part.split(/(`[^`]+`)/g);
+                for (const codePart of codeParts) {
+                    if (codePart.startsWith('`') && codePart.endsWith('`')) {
+                        elements.push({
+                            tag: 'text',
+                            text: codePart.slice(1, -1),
+                        });
+                    } else if (codePart) {
+                        elements.push({ tag: 'text', text: codePart });
+                    }
+                }
             }
-
-            lastIndex = match.index + content.length;
         }
 
-        // 添加剩余文本
-        if (lastIndex < text.length) {
-            elements.push({
-                tag: 'text',
-                text: text.substring(lastIndex),
-            });
-        }
-
-        // 如果没有匹配到任何格式，返回原文
         if (elements.length === 0) {
             elements.push({ tag: 'text', text: text });
         }
@@ -287,8 +227,8 @@ class FeishuClient {
                 },
             });
             console.log('✅ 富文本消息发送成功\n');
-        } catch (error) {
-            console.error('❌ 发送失败:', error);
+        } catch (error: any) {
+            console.error('❌ 发送失败:', error.response?.data || error.message);
         }
     }
 
@@ -308,8 +248,8 @@ class FeishuClient {
                 },
             });
             console.log('✅ 纯文本消息发送成功\n');
-        } catch (error) {
-            console.error('❌ 发送失败:', error);
+        } catch (error: any) {
+            console.error('❌ 发送失败:', error.response?.data || error.message);
         }
     }
 
@@ -329,10 +269,10 @@ class FeishuClient {
                 // 标题
                 {
                     tag: 'div',
-                    text: { tag: 'plain_text', content: '一、A股市场整体情况', style: { bold: true, fontsize: 2 } },
+                    text: { tag: 'plain_text', content: '一、A股市场整体情况' },
                 },
                 { tag: 'hr' },
-                // 列表
+                // 列表 - 使用 lark_md 支持粗体
                 {
                     tag: 'div',
                     text: { tag: 'lark_md', content: '• **上证指数**: 约3880点，近期下跌约1%' },
@@ -345,9 +285,9 @@ class FeishuClient {
                 // 标题
                 {
                     tag: 'div',
-                    text: { tag: 'plain_text', content: '二、国际油价影响', style: { bold: true, fontsize: 2 } },
+                    text: { tag: 'plain_text', content: '二、国际油价影响' },
                 },
-                // 表格
+                // 表格 - 使用 column_set
                 {
                     tag: 'column_set',
                     flex_mode: 'stretch',
@@ -358,7 +298,7 @@ class FeishuClient {
                             width: 'weighted',
                             weight: 1,
                             elements: [
-                                { tag: 'div', text: { tag: 'plain_text', content: '品种', style: { bold: true } } },
+                                { tag: 'div', text: { tag: 'plain_text', content: '品种' } },
                                 { tag: 'div', text: { tag: 'plain_text', content: '布伦特原油' } },
                                 { tag: 'div', text: { tag: 'plain_text', content: 'WTI原油' } },
                             ],
@@ -368,7 +308,7 @@ class FeishuClient {
                             width: 'weighted',
                             weight: 1,
                             elements: [
-                                { tag: 'div', text: { tag: 'plain_text', content: '最新价格', style: { bold: true } } },
+                                { tag: 'div', text: { tag: 'plain_text', content: '最新价格' } },
                                 { tag: 'div', text: { tag: 'plain_text', content: '$85.32' } },
                                 { tag: 'div', text: { tag: 'plain_text', content: '$81.15' } },
                             ],
@@ -378,7 +318,7 @@ class FeishuClient {
                             width: 'weighted',
                             weight: 1,
                             elements: [
-                                { tag: 'div', text: { tag: 'plain_text', content: '涨跌', style: { bold: true } } },
+                                { tag: 'div', text: { tag: 'plain_text', content: '涨跌' } },
                                 { tag: 'div', text: { tag: 'plain_text', content: '+1.2%' } },
                                 { tag: 'div', text: { tag: 'plain_text', content: '+0.9%' } },
                             ],
@@ -386,13 +326,13 @@ class FeishuClient {
                     ],
                 },
                 { tag: 'hr' },
-                // 引用
+                // 引用 - 使用 note
                 {
                     tag: 'note',
                     elements: [{ tag: 'plain_text', content: '💡 注意：以上数据仅供参考，投资有风险' }],
                 },
                 { tag: 'hr' },
-                // 总结
+                // 总结 - lark_md 粗体
                 {
                     tag: 'div',
                     text: { tag: 'lark_md', content: '**总结**: 建议关注政策动向和海外市场变化。' },
@@ -410,8 +350,8 @@ class FeishuClient {
                 },
             });
             console.log('✅ 结构化卡片发送成功\n');
-        } catch (error) {
-            console.error('❌ 发送失败:', error);
+        } catch (error: any) {
+            console.error('❌ 发送失败:', error.response?.data || error.message);
         }
     }
 }
