@@ -1,5 +1,6 @@
 /**
- * 飞书 ACP Agent - 精简版（带 Markdown 渲染和思考过程输出）
+ * 飞书 ACP Agent - 精简版
+ * 使用 feishu-messaging 模块发送消息
  */
 
 import * as dotenv from 'dotenv';
@@ -17,6 +18,11 @@ import {
 } from '@agentclientprotocol/sdk';
 import { spawn } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
+import {
+    initFeishuClient,
+    sendPostMessage,
+    sendStructuredCard,
+} from '../feishu-messaging.js';
 
 dotenv.config();
 
@@ -47,7 +53,6 @@ interface ChatSession {
     lastActivity: number;
 }
 
-// 思考过程和工具调用收集器
 interface ThinkingProcess {
     thought: string;
     toolCalls: ToolCallInfo[];
@@ -60,11 +65,8 @@ interface ToolCallInfo {
     timestamp: number;
 }
 
-// ============ 核心类 ============
+// ============ ACP 客户端 ============
 
-/**
- * ACP 客户端（带思考过程输出）
- */
 class AcpClient implements Client {
     private connection?: ClientSideConnection;
     private streamCollector?: {
@@ -117,7 +119,6 @@ class AcpClient implements Client {
 
         if (!sessionId || !updateType) return;
 
-        // 处理不同类型的更新
         switch (updateType) {
             case 'agent_message_chunk':
                 if (content?.text) {
@@ -137,9 +138,6 @@ class AcpClient implements Client {
                     console.log(`[ACP]    Params:`, JSON.stringify(toolCall.params).substring(0, 200));
                 }
                 this.streamCollector?.onToolCall?.(toolCall);
-                break;
-            case 'tool_call_update':
-                console.log(`[ACP] 📊 Tool call update received`);
                 break;
         }
     }
@@ -163,7 +161,6 @@ class AcpClient implements Client {
         return response.sessionId;
     }
 
-    // 流式发送消息（带思考过程收集）
     async sendMessageStream(sessionId: string, prompt: string): Promise<{ message: string; thinking: ThinkingProcess }> {
         let fullMessage = '';
         const thinking: ThinkingProcess = {
@@ -196,265 +193,16 @@ class AcpClient implements Client {
     }
 }
 
-/**
- * 飞书客户端（带结构化 Markdown 渲染）
- */
-class FeishuClient {
-    private client: lark.Client;
-
-    constructor() {
-        this.client = new lark.Client({
-            appId: FEISHU_APP_ID!,
-            appSecret: FEISHU_APP_SECRET!,
-            appType: lark.AppType.SelfBuild,
-            domain: lark.Domain.Feishu,
-        });
-    }
-
-    /**
-     * 发送结构化卡片（支持表格、标题等）
-     */
-    async sendStructuredCard(receiveId: string, title: string, content: string, thinking?: ThinkingProcess) {
-        const elements: any[] = [];
-
-        // 如果有思考过程，添加可折叠面板
-        if (thinking && (thinking.thought || thinking.toolCalls.length > 0)) {
-            let thoughtContent = '';
-            
-            if (thinking.thought) {
-                thoughtContent += `💭 **思考过程**\n${thinking.thought.substring(0, 500)}\n\n`;
-            }
-            
-            if (thinking.toolCalls.length > 0) {
-                thoughtContent += `🔧 **工具调用** (${thinking.toolCalls.length} 个)\n\n`;
-                thinking.toolCalls.forEach((tc, i) => {
-                    thoughtContent += `${i + 1}. **${tc.name}**`;
-                    if (tc.params) {
-                        const paramsStr = JSON.stringify(tc.params).substring(0, 100);
-                        thoughtContent += `  \n   参数: \`${paramsStr}\``;
-                    }
-                    thoughtContent += '\n\n';
-                });
-            }
-
-            // 简化为普通 div 显示（避免 collapsible_panel 兼容性问题）
-            elements.push({
-                tag: 'div',
-                text: {
-                    tag: 'lark_md',
-                    content: thoughtContent.trim(),
-                },
-            });
-            elements.push({ tag: 'hr' });
-        }
-
-        // 解析并添加主要内容
-        const contentElements = this.parseContentToElements(content);
-        elements.push(...contentElements);
-
-        const card = {
-            config: { wide_screen_mode: true },
-            header: {
-                title: { tag: 'plain_text', content: title },
-                template: 'green',
-            },
-            elements,
-        };
-
-        try {
-            await this.client.im.message.create({
-                params: { receive_id_type: 'open_id' },
-                data: {
-                    receive_id: receiveId,
-                    msg_type: 'interactive',
-                    content: JSON.stringify(card),
-                },
-            });
-        } catch (error) {
-            console.error('[Feishu] Failed to send card:', error);
-            await this.sendTextMessage(receiveId, content);
-        }
-    }
-
-    /**
-     * 将内容解析为飞书卡片元素
-     */
-    private parseContentToElements(content: string): any[] {
-        const elements: any[] = [];
-        const lines = content.split('\n');
-        let i = 0;
-
-        while (i < lines.length) {
-            const line = lines[i].trim();
-
-            // 空行跳过
-            if (line === '') {
-                i++;
-                continue;
-            }
-
-            // 一级标题
-            if (line.startsWith('# ') && !line.startsWith('## ')) {
-                elements.push({
-                    tag: 'div',
-                    text: {
-                        tag: 'plain_text',
-                        content: line.substring(2),
-                        style: { bold: true, fontsize: 3 },
-                    },
-                });
-                i++;
-                continue;
-            }
-
-            // 二级标题
-            if (line.startsWith('## ') && !line.startsWith('### ')) {
-                elements.push({
-                    tag: 'div',
-                    text: {
-                        tag: 'plain_text',
-                        content: line.substring(3),
-                        style: { bold: true, fontsize: 2 },
-                    },
-                });
-                i++;
-                continue;
-            }
-
-            // 三级标题
-            if (line.startsWith('### ')) {
-                elements.push({
-                    tag: 'div',
-                    text: {
-                        tag: 'plain_text',
-                        content: line.substring(4),
-                        style: { bold: true, fontsize: 1 },
-                    },
-                });
-                i++;
-                continue;
-            }
-
-            // 表格
-            if (line.includes('|')) {
-                const tableRows: string[][] = [];
-                while (i < lines.length && lines[i].trim().includes('|')) {
-                    const row = lines[i].trim();
-                    // 跳过分隔线 |---|---|
-                    if (!row.match(/^\|[-:\s|]+\|$/)) {
-                        const cells = row.split('|').map(c => c.trim()).filter(c => c);
-                        if (cells.length > 0) {
-                            tableRows.push(cells);
-                        }
-                    }
-                    i++;
-                }
-
-                if (tableRows.length > 0) {
-                    // 使用 column_set 实现表格
-                    const columns = tableRows[0].map((_, colIndex) => ({
-                        tag: 'column',
-                        width: 'weighted',
-                        weight: 1,
-                        elements: tableRows.map(row => ({
-                            tag: 'div',
-                            text: {
-                                tag: 'lark_md',
-                                content: row[colIndex] || '',
-                            },
-                        })),
-                    }));
-
-                    elements.push({
-                        tag: 'column_set',
-                        flex_mode: 'stretch',
-                        background_style: 'grey',
-                        columns,
-                    });
-                }
-                continue;
-            }
-
-            // 列表项
-            if (line.startsWith('- ') || line.startsWith('* ')) {
-                const listItems: any[] = [];
-                while (i < lines.length) {
-                    const itemLine = lines[i].trim();
-                    if (!itemLine.startsWith('- ') && !itemLine.startsWith('* ')) break;
-                    
-                    const itemText = itemLine.substring(2);
-                    listItems.push({
-                        tag: 'div',
-                        text: {
-                            tag: 'lark_md',
-                            content: '• ' + itemText,
-                        },
-                    });
-                    i++;
-                }
-                elements.push(...listItems);
-                continue;
-            }
-
-            // 引用
-            if (line.startsWith('> ')) {
-                elements.push({
-                    tag: 'note',
-                    elements: [
-                        {
-                            tag: 'plain_text',
-                            content: line.substring(2),
-                        },
-                    ],
-                });
-                i++;
-                continue;
-            }
-
-            // 分割线
-            if (line === '---' || line === '***') {
-                elements.push({ tag: 'hr' });
-                i++;
-                continue;
-            }
-
-            // 普通段落（带行内 Markdown）
-            elements.push({
-                tag: 'div',
-                text: {
-                    tag: 'lark_md',
-                    content: line,
-                },
-            });
-            i++;
-        }
-
-        return elements;
-    }
-
-    /**
-     * 发送纯文本消息（后备方案）
-     */
-    async sendTextMessage(receiveId: string, text: string) {
-        await this.client.im.message.create({
-            params: { receive_id_type: 'open_id' },
-            data: {
-                receive_id: receiveId,
-                msg_type: 'text',
-                content: JSON.stringify({ text }),
-            },
-        });
-    }
-}
-
 // ============ 主程序 ============
 
 async function main() {
+    // 1. 连接 ACP
     const agentPath = process.env.ACP_AGENT_PATH || 'kimi';
     const acp = new AcpClient();
     await acp.connect(agentPath);
 
-    const feishu = new FeishuClient();
+    // 2. 初始化飞书客户端
+    initFeishuClient(FEISHU_APP_ID!, FEISHU_APP_SECRET!);
     console.log('[Feishu] Client initialized');
 
     const sessions = new Map<string, ChatSession>();
@@ -520,10 +268,10 @@ async function main() {
                 );
                 console.log(`[Offset] Rounds: ${session.messageHistory.length}, Offset: ${contentOffset}`);
 
-                // 发送到 ACP（带思考过程）
+                // 发送到 ACP
                 console.log(`[ACP] Sending: ${content.substring(0, 50)}...`);
                 const { message: fullReply, thinking } = await acp.sendMessageStream(session.acpSessionId, content);
-                
+
                 console.log(`\n[ACP] 📊 Response Summary:`);
                 console.log(`  - Full length: ${fullReply.length} chars`);
                 console.log(`  - Thought length: ${thinking.thought.length} chars`);
@@ -561,9 +309,16 @@ async function main() {
 
                 console.log(`[ACP] Actual reply: ${actualReply.substring(0, 80)}...`);
 
-                // 发送结构化卡片
-                await feishu.sendStructuredCard(senderId, 'Kimi', actualReply, thinking);
-                console.log(`[Feishu] ✅ Sent: ${actualReply.length} chars`);
+                // ============ 使用 feishu-messaging 模块发送消息 ============
+                
+                // 方案1: 发送结构化卡片（推荐，支持 Markdown 渲染）
+                await sendStructuredCard(senderId, 'Kimi', actualReply, thinking);
+                console.log(`[Feishu] ✅ Structured card sent: ${actualReply.length} chars`);
+
+                // 备选方案: 如果需要简化格式，使用富文本
+                // await sendPostMessage(senderId, 'Kimi', actualReply);
+                // console.log(`[Feishu] ✅ Post message sent: ${actualReply.length} chars`);
+
                 console.log(`${'='.repeat(50)}\n`);
 
             } catch (error) {
