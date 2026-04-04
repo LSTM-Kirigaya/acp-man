@@ -32,6 +32,26 @@ export interface ChatSession {
   lastActivity: number;
   /** 最后发送者信息（用于私聊回复） */
   lastSender?: SenderInfo;
+  /** 消息历史记录（用于计算内容偏移量） */
+  messageHistory?: MessageHistory[];
+}
+
+/** 消息历史记录（用于追踪每轮对话的内容偏移） */
+export interface MessageHistory {
+  /** 消息 ID */
+  messageId: string;
+  /** 用户输入内容 */
+  userInput: string;
+  /** AI 完整回复内容（包含可能的累积内容） */
+  aiFullResponse: string;
+  /** AI 本轮真实回复（通过偏移量截取） */
+  aiActualResponse: string;
+  /** 内容偏移量（起始位置） */
+  contentOffset: number;
+  /** 内容长度 */
+  contentLength: number;
+  /** 时间戳 */
+  timestamp: number;
 }
 
 /** 队列中的消息 */
@@ -185,4 +205,40 @@ export interface AcpResponseHandler {
   onComplete: (response: string) => void;
   /** 处理错误 */
   onError: (error: Error) => void;
+}
+
+/** ACP 处理进度（用于显示思考过程和工具调用） */
+export interface AcpProcessingProgress {
+  /** 思考过程 */
+  thought: string;
+  /** 工具调用列表 */
+  toolCalls: ToolCallInfo[];
+  /** 最终回复 */
+  message: string;
+  /** 是否已完成 */
+  isComplete: boolean;
+  /** 开始时间 */
+  startTime: number;
+  /** 结束时间 */
+  endTime?: number;
+  /** 内部使用：飞书消息ID（用于更新卡片） */
+  _feishuMessageId?: string;
+  /** 内部使用：飞书接收者ID */
+  _feishuReceiveId?: string;
+  /** 内部使用：飞书聊天类型 */
+  _feishuChatType?: 'private' | 'group';
+}
+
+/** 工具调用信息 */
+export interface ToolCallInfo {
+  /** 工具名称 */
+  name: string;
+  /** 调用参数 */
+  params?: Record<string, unknown>;
+  /** 调用结果 */
+  result?: string;
+  /** 调用时间 */
+  timestamp: number;
+  /** 是否完成 */
+  isComplete: boolean;
 }

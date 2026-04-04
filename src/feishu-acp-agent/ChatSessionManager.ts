@@ -13,7 +13,10 @@ import type {
   SenderInfo, 
   MessageContent,
   PendingMedia,
-  FeishuAcpAgentConfig 
+  FeishuAcpAgentConfig,
+  AcpProcessingProgress,
+  ToolCallInfo,
+  MessageHistory
 } from './types.js';
 import { KimiAcpClient } from '../kimi-acp-client/index.js';
 import { ConfigManager } from './ConfigManager.js';
@@ -36,6 +39,9 @@ export class ChatSessionManager extends EventEmitter {
   private config: FeishuAcpAgentConfig;
   private options: Required<SessionManagerOptions>;
   private configManager: ConfigManager;
+  
+  // chatId -> sessionId 的映射，确保同一聊天使用固定的 UUID
+  private sessionIdMap: Map<string, string> = new Map();
 
   constructor(
     config: FeishuAcpAgentConfig,
@@ -93,6 +99,7 @@ export class ChatSessionManager extends EventEmitter {
         isProcessing: false,
         pendingMedia: [],
         lastActivity: Date.now(),
+        messageHistory: [], // 初始化消息历史
       };
       
       this.sessions.set(chatId, session);
@@ -167,7 +174,9 @@ export class ChatSessionManager extends EventEmitter {
     content: MessageContent,
     name?: string
   ): Promise<QueuedMessage | null> {
+    console.log(`[ChatSessionManager] enqueueMessage: chatId=${chatId.substring(0, 16)}, existing=${this.sessions.has(chatId)}`);
     const session = this.getOrCreateSession(chatId, chatType, name);
+    console.log(`[ChatSessionManager] session after getOrCreate: acpSessionId=${session.acpSessionId || 'undefined'}`);
 
     // 群聊检查是否已绑定
     if (chatType === 'group' && !session.bindPath) {
@@ -281,19 +290,54 @@ export class ChatSessionManager extends EventEmitter {
    * 处理单条消息
    */
   private async handleMessage(session: ChatSession, message: QueuedMessage): Promise<void> {
-    // 私聊或已绑定的群聊，直接使用 bindPath
-    const workPath = session.bindPath!;
+    // 打印用户问题（最醒目的格式，确保无论发生什么都能看到）
+    console.log('\n╔══════════════════════════════════════════════════════════╗');
+    console.log('║  👤 用户问题                                              ║');
+    console.log('╠══════════════════════════════════════════════════════════╣');
+    console.log(`║  ${(message.content.text || '(无文本)').substring(0, 52).padEnd(52)} ║`);
+    console.log('╚══════════════════════════════════════════════════════════╝');
 
-    // 准备 ACP 会话
-    if (!session.acpSessionId) {
-      try {
-        const acpResponse = await this.acpClient.newSession(workPath, {
-          sessionId: `feishu_${session.chatType}_${session.chatId}_${Date.now()}`,
-        });
-        session.acpSessionId = acpResponse.sessionId;
-      } catch (error) {
-        throw new Error(`创建 ACP 会话失败: ${(error as Error).message}`);
-      }
+    try {
+      await this._handleMessageInternal(session, message);
+    } catch (error) {
+      console.error(`[ChatSessionManager] ❌ Error processing message: ${(error as Error).message}`);
+      throw error;
+    }
+  }
+
+  private async _handleMessageInternal(session: ChatSession, message: QueuedMessage): Promise<void> {
+    // 私聊或已绑定的群聊，直接使用 bindPath
+    const workPath = session.bindPath;
+
+    console.log(`[ChatSessionManager] handleMessage: chatId=${session.chatId.substring(0, 16)}`);
+    console.log(`[ChatSessionManager] 使用独立会话模式（每条消息新建会话，无历史累积）`);
+    
+    // 检查 workPath
+    if (!workPath) {
+      console.error(`[ChatSessionManager] ERROR: workPath is undefined! bindPath=${session.bindPath}, chatType=${session.chatType}`);
+      throw new Error(`工作路径未设置，请检查配置`);
+    }
+
+    // === 关键改动1: 每条消息使用独立会话 ===
+    // 生成唯一的 sessionId（基于消息ID），确保每条消息都是独立会话
+    const messageSessionId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    let acpSessionId: string;
+    
+    try {
+      console.log(`[ChatSessionManager] Creating isolated ACP session for this message:`);
+      console.log(`  - sessionId: ${messageSessionId}`);
+      console.log(`  - workPath: ${workPath}`);
+      
+      const acpResponse = await this.acpClient.newSession(workPath, { 
+        sessionId: messageSessionId,
+        mcpServers: [],  // 必填字段
+      });
+      acpSessionId = acpResponse.sessionId;
+      console.log(`[ChatSessionManager] ✅ Isolated session created: ${acpSessionId}`);
+    } catch (error) {
+      const errorMsg = (error as Error).message;
+      console.error(`[ChatSessionManager] ❌ Failed to create session: ${errorMsg}`);
+      throw new Error(`创建 ACP 会话失败: ${errorMsg}`);
     }
 
     // 收集上下文
@@ -345,63 +389,203 @@ export class ChatSessionManager extends EventEmitter {
     }
     console.log('└─────────────────────────────────────────────────────────┘');
 
-    // 发送消息到 ACP
-    let responseText = '';
-
-    const response = await this.acpClient.sendMessage(
-      session.acpSessionId!,
-      prompt,
-      { contextFiles }
-    );
-
-    if ('message' in response && typeof response.message === 'string') {
-      responseText = response.message;
-    } else {
-      responseText = '✅ 处理完成（无文本回复）';
+    // === 关键改动2: 初始化消息历史记录 ===
+    if (!session.messageHistory) {
+      session.messageHistory = [];
     }
+
+    // 计算内容偏移量（历史内容总长度）
+    const contentOffset = session.messageHistory.reduce((sum, h) => sum + h.contentLength, 0);
+    console.log(`[ChatSessionManager] Content offset calculation:`);
+    console.log(`  - History rounds: ${session.messageHistory.length}`);
+    console.log(`  - Total offset: ${contentOffset} chars`);
+
+    // === 关键改动3: 收集思考过程和工具调用 ===
+    const progress: AcpProcessingProgress = {
+      thought: '',
+      toolCalls: [],
+      message: '',
+      isComplete: false,
+      startTime: Date.now(),
+    };
+
+    // 发送消息到 ACP（流式）
+    try {
+      console.log('[ChatSessionManager] Starting sendMessageStream with progress tracking...');
+      
+      // 发送进度开始事件
+      this.emit('progressStarted', { session, message, progress });
+      
+      const result = await this.acpClient.sendMessageStream(
+        acpSessionId,
+        prompt,
+        {
+          onMessageChunk: (chunk: string) => {
+            progress.message += chunk;
+            // 发送进度更新事件（包含当前思考过程和工具调用）
+            this.emit('progressUpdated', { session, message, progress });
+          },
+          onThoughtChunk: (chunk: string) => {
+            progress.thought += chunk;
+            console.log(`[ChatSessionManager] 💭 Thought: ${chunk.substring(0, 100)}...`);
+            this.emit('progressUpdated', { session, message, progress });
+          },
+          onToolCall: (toolCall: unknown) => {
+            const toolCallInfo = this.parseToolCall(toolCall);
+            progress.toolCalls.push(toolCallInfo);
+            console.log(`[ChatSessionManager] 🔧 Tool call: ${toolCallInfo.name}`);
+            this.emit('progressUpdated', { session, message, progress });
+          },
+          onComplete: () => {
+            progress.isComplete = true;
+            progress.endTime = Date.now();
+            console.log('[ChatSessionManager] Stream complete');
+          },
+          onError: (error: Error) => {
+            console.error('[ChatSessionManager] Stream error:', error);
+          },
+        },
+        { contextFiles }
+      );
+
+      // 优先使用 result.message
+      if (result.message && result.message.length > progress.message.length) {
+        progress.message = result.message;
+      }
+
+      if (!progress.message) {
+        progress.message = '✅ 处理完成（无文本回复）';
+      }
+
+      progress.isComplete = true;
+      progress.endTime = Date.now();
+
+      console.log(`[ChatSessionManager] Stream ended. Collected:`);
+      console.log(`  - Thought: ${progress.thought.length} chars`);
+      console.log(`  - Tool calls: ${progress.toolCalls.length}`);
+      console.log(`  - Raw message: ${progress.message.length} chars`);
+
+    } catch (error) {
+      console.error('[ChatSessionManager] Error sending message:', error);
+      progress.message = `❌ 处理失败: ${(error as Error).message}`;
+      progress.isComplete = true;
+      progress.endTime = Date.now();
+    }
+
+    // === 关键改动4: 通过偏移量截取本轮真实回复 ===
+    let actualResponse = progress.message;
+    
+    if (contentOffset > 0 && progress.message.length > contentOffset) {
+      // 如果总长度大于偏移量，截取新增内容
+      actualResponse = progress.message.substring(contentOffset).trim();
+      console.log(`[ChatSessionManager] Content sliced by offset:`);
+      console.log(`  - Full length: ${progress.message.length}`);
+      console.log(`  - Offset: ${contentOffset}`);
+      console.log(`  - Actual response: ${actualResponse.length} chars`);
+    } else if (session.messageHistory.length > 0) {
+      // 尝试通过内容匹配来去重
+      const lastResponse = session.messageHistory[session.messageHistory.length - 1]?.aiActualResponse;
+      if (lastResponse && progress.message.startsWith(lastResponse)) {
+        actualResponse = progress.message.substring(lastResponse.length).trim();
+        console.log(`[ChatSessionManager] Content sliced by prefix matching:`);
+        console.log(`  - Detected duplicate prefix: ${lastResponse.length} chars`);
+        console.log(`  - Actual response: ${actualResponse.length} chars`);
+      }
+    }
+
+    // 记录到消息历史
+    const historyEntry = {
+      messageId: message.id,
+      userInput: message.content.text || '',
+      aiFullResponse: progress.message,
+      aiActualResponse: actualResponse,
+      contentOffset,
+      contentLength: actualResponse.length,
+      timestamp: Date.now(),
+    };
+    session.messageHistory.push(historyEntry);
 
     // 打印 Kimi 的回复
     console.log('\n┌─────────────────────────────────────────────────────────┐');
     console.log('│  📥 Kimi ACP 回复                                       │');
     console.log('├─────────────────────────────────────────────────────────┤');
-    const responseLines = responseText.split('\n').slice(0, 5);
+    if (progress.thought) {
+      console.log(`│  💭 思考过程: ${progress.thought.substring(0, 40).padEnd(40)} │`);
+    }
+    if (progress.toolCalls.length > 0) {
+      console.log(`│  🔧 工具调用: ${progress.toolCalls.length} 个`.padEnd(56) + '│');
+    }
+    console.log(`│  📊 历史轮次: ${session.messageHistory.length} 轮`.padEnd(56) + '│');
+    console.log(`│  ✂️  截取后长度: ${actualResponse.length}/${progress.message.length} chars`.padEnd(56) + '│');
+    const responseLines = actualResponse.split('\n').slice(0, 5);
     for (const line of responseLines) {
       console.log(`│  ${line.substring(0, 53).padEnd(53)} │`);
     }
-    if (responseText.split('\n').length > 5) {
-      console.log(`│  ... (${responseText.split('\n').length - 5} 行省略)`.padEnd(55) + '│');
+    if (actualResponse.split('\n').length > 5) {
+      console.log(`│  ... (${actualResponse.split('\n').length - 5} 行省略)`.padEnd(55) + '│');
     }
     console.log('└─────────────────────────────────────────────────────────┘\n');
 
-    this.emit('replyNeeded', {
+    // === 关键改动5: 发送带进度的回复事件（使用截取后的内容） ===
+    this.emit('replyWithProgress', {
       session,
-      message: responseText,
+      message: actualResponse, // 使用截取后的真实回复
+      progress: {
+        ...progress,
+        message: actualResponse, // 确保进度中也使用截取后的内容
+      },
     });
+
+    // === 关键改动4: 关闭会话（确保每条消息独立）===
+    try {
+      console.log(`[ChatSessionManager] Closing isolated session: ${acpSessionId}`);
+      await this.acpClient.cancelSession(acpSessionId);
+      console.log(`[ChatSessionManager] ✅ Session closed`);
+    } catch (error) {
+      console.warn(`[ChatSessionManager] Warning: Failed to close session: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 解析工具调用信息
+   */
+  private parseToolCall(toolCall: unknown): ToolCallInfo {
+    const tc = toolCall as Record<string, unknown>;
+    return {
+      name: (tc.toolCall as Record<string, string>)?.title || 
+            (tc.toolCall as Record<string, string>)?.name || 
+            'Unknown Tool',
+      params: tc.params as Record<string, unknown> || tc.arguments as Record<string, unknown>,
+      result: tc.result as string,
+      timestamp: Date.now(),
+      isComplete: !!tc.result,
+    };
   }
 
   /**
    * 清理过期会话
+   * 
+   * 注意：这里只清理本地引用，不关闭 ACP 会话。
+   * ACP 会话由 Agent 端管理，下次需要时可以重新连接或创建新的。
+   * 私聊场景下，我们希望保持会话，所以延长超时时间或禁用清理。
    */
   private cleanupExpiredSessions(): void {
+    // 私聊会话不应该被自动清理，保持长期连接
+    // 如果需要清理，应该同时关闭 ACP 会话
+    // 当前实现：只记录，不实际清理
     const now = Date.now();
-    const expiredSessions: string[] = [];
+    const idleSessions: string[] = [];
 
     for (const [chatId, session] of this.sessions) {
-      if (now - session.lastActivity > this.options.sessionTimeout) {
-        expiredSessions.push(chatId);
+      const idleTime = now - session.lastActivity;
+      if (idleTime > this.options.sessionTimeout) {
+        idleSessions.push(`${chatId.substring(0, 16)}...(${Math.floor(idleTime / 60000)}min)`);
       }
     }
 
-    for (const chatId of expiredSessions) {
-      const session = this.sessions.get(chatId);
-      if (session) {
-        this.sessions.delete(chatId);
-        this.emit('sessionExpired', session);
-      }
-    }
-
-    if (expiredSessions.length > 0) {
-      console.log(`[ChatSessionManager] Cleaned up ${expiredSessions.length} expired sessions`);
+    if (idleSessions.length > 0) {
+      console.log(`[ChatSessionManager] ${idleSessions.length} sessions idle: ${idleSessions.join(', ')}`);
+      // 不实际删除，保持会话
     }
   }
 
@@ -422,6 +606,58 @@ export class ChatSessionManager extends EventEmitter {
     this.sessions.delete(chatId);
     this.emit('sessionDeleted', session);
     return true;
+  }
+
+  /**
+   * 重置会话 - 清除 ACP 会话ID，下次会创建新会话
+   * 用于解决消息累积问题
+   */
+  resetSession(chatId: string): boolean {
+    const session = this.sessions.get(chatId);
+    if (!session) return false;
+
+    const oldSessionId = session.acpSessionId;
+    session.acpSessionId = undefined;
+    session.messageQueue = [];
+    session.pendingMedia = [];
+    session.messageHistory = []; // 清除消息历史
+    session.lastActivity = Date.now();
+    
+    // 从 sessionIdMap 中删除，下次会生成新的 sessionId
+    this.sessionIdMap.delete(chatId);
+    
+    console.log(`[ChatSessionManager] Session reset for ${chatId.substring(0, 16)}..., old sessionId: ${oldSessionId || 'none'}`);
+    this.emit('sessionReset', { session, oldSessionId });
+    return true;
+  }
+
+  /**
+   * 重置所有会话
+   */
+  resetAllSessions(): void {
+    for (const chatId of this.sessions.keys()) {
+      this.resetSession(chatId);
+    }
+    console.log('[ChatSessionManager] All sessions reset');
+  }
+
+  /**
+   * 获取稳定的 sessionId（UUID 格式）
+   * 同一 chatId 始终返回相同的 UUID
+   */
+  private getStableSessionId(chatId: string): string {
+    let sessionId = this.sessionIdMap.get(chatId);
+    if (!sessionId) {
+      // 生成 UUID v4 格式
+      sessionId = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+      this.sessionIdMap.set(chatId, sessionId);
+      console.log(`[ChatSessionManager] Generated new sessionId for ${chatId.substring(0, 16)}: ${sessionId}`);
+    }
+    return sessionId;
   }
 }
 

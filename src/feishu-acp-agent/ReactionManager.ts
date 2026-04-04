@@ -68,7 +68,7 @@ export class ReactionManager {
       const reactionId = data.data?.reaction_id;
       if (reactionId) {
         this.activeReactions.set(messageId, reactionId);
-        console.log(`[ReactionManager] Added typing reaction 🤔 to message ${messageId.substring(0, 16)}...`);
+        console.log(`[ReactionManager] Added typing reaction ⌨️ to message ${messageId.substring(0, 16)}...`);
       }
 
       return reactionId;

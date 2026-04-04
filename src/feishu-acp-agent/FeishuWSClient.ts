@@ -47,11 +47,14 @@ export class FeishuWSClient extends EventEmitter {
     this.registerHandlers();
 
     // 创建 WebSocket 客户端
+    // 强制开启 DEBUG 模式以查看所有消息
     this.wsClient = new lark.WSClient({
       appId: this.options.appId,
       appSecret: this.options.appSecret,
-      loggerLevel: this.options.debug ? lark.LoggerLevel.DEBUG : lark.LoggerLevel.INFO,
+      loggerLevel: lark.LoggerLevel.DEBUG,  // 强制 DEBUG 模式
     });
+    
+    console.log('[FeishuWSClient] DEBUG mode enabled - all events will be logged');
 
     // 启动连接
     await this.wsClient.start({
@@ -87,10 +90,13 @@ export class FeishuWSClient extends EventEmitter {
 
     console.log('[FeishuWSClient] Registering event handlers...');
 
-    // 处理消息接收事件
+    // 处理消息接收事件（私聊和群聊）
+    // 注意：飞书可能有不同的事件类型，我们监听所有可能的消息事件
     this.eventDispatcher.register({
+      // 标准消息接收事件
       'im.message.receive_v1': async (data: any) => {
         console.log('[FeishuWSClient] 📨 Received im.message.receive_v1 event');
+        console.log('[FeishuWSClient] Raw data:', JSON.stringify(data, null, 2).substring(0, 800));
         
         try {
           const event = this.parseMessageEvent(data);
@@ -101,6 +107,34 @@ export class FeishuWSClient extends EventEmitter {
           console.error('[FeishuWSClient] Error parsing message event:', error);
           console.error('[FeishuWSClient] Raw data:', JSON.stringify(data, null, 2));
         }
+      },
+
+      // 私聊消息事件（备选）
+      'im.message.p2p_msg': async (data: any) => {
+        console.log('[FeishuWSClient] 📨 Received im.message.p2p_msg event');
+        console.log('[FeishuWSClient] Raw data:', JSON.stringify(data, null, 2).substring(0, 800));
+        this.emit('message', data);
+      },
+
+      // 群聊消息事件（备选）
+      'im.message.group_msg': async (data: any) => {
+        console.log('[FeishuWSClient] 📨 Received im.message.group_msg event');
+        console.log('[FeishuWSClient] Raw data:', JSON.stringify(data, null, 2).substring(0, 800));
+        
+        try {
+          const event = this.parseMessageEvent(data);
+          const chatType = event.event.message.chat_type;
+          console.log(`[FeishuWSClient] Message type: ${chatType === 'p2p' ? 'private' : 'group'}`);
+          this.emit('message', event);
+        } catch (error) {
+          console.error('[FeishuWSClient] Error parsing message event:', error);
+          console.error('[FeishuWSClient] Raw data:', JSON.stringify(data, null, 2));
+        }
+      },
+
+      // 处理表情回复事件（用于调试）
+      'im.message.reaction.created_v1': async (data: any) => {
+        console.log('[FeishuWSClient] 😊 Reaction created:', JSON.stringify(data).substring(0, 200));
       },
 
       // 处理机器人被添加进群
@@ -114,9 +148,24 @@ export class FeishuWSClient extends EventEmitter {
         console.log('[FeishuWSClient] Bot removed from chat');
         this.emit('botRemoved', data);
       },
+
+      // 处理消息已读事件（避免警告）
+      'im.message.message_read_v1': async (data: any) => {
+        // 消息已读事件，无需特殊处理
+        if (this.options.debug) {
+          console.log('[FeishuWSClient] Message read event:', JSON.stringify(data).substring(0, 200));
+        }
+      },
     });
 
-    console.log('[FeishuWSClient] Event handlers registered');
+    console.log('[FeishuWSClient] ✅ Event handlers registered:');
+    console.log('  - im.message.receive_v1 (standard message)');
+    console.log('  - im.message.p2p_msg (private message)');
+    console.log('  - im.message.group_msg (group message)');
+    console.log('  - im.message.reaction.created_v1 (reaction)');
+    console.log('  - im.message.message_read_v1 (message read)');
+    console.log('  - im.chat.member.bot.added_v1 (bot added)');
+    console.log('  - im.chat.member.bot.deleted_v1 (bot removed)');
   }
 
   /**

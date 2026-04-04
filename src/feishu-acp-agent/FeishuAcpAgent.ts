@@ -32,6 +32,10 @@ export class FeishuAcpAgent {
   private configManager: ConfigManager;
   private isRunning = false;
   private processingMessages: Set<string> = new Set();
+  // 消息去重：记录已处理的消息ID和时间戳
+  private processedMessages: Map<string, number> = new Map();
+  // 消息去重时间窗口（毫秒）
+  private readonly MESSAGE_DEDUP_WINDOW = 60 * 1000; // 1分钟
 
   constructor(config: FeishuAcpAgentConfig) {
     this.config = config;
@@ -101,8 +105,74 @@ export class FeishuAcpAgent {
       await this.sendTextMessage(receiveId, session.chatType, message);
     });
 
-    this.sessionManager.on('processingStarted', ({ session, message }) => {
-      console.log(`[Agent] Processing message in ${session.name || session.chatId}: ${message.content.text?.substring(0, 50)}...`);
+    // === 新的进度事件处理 ===
+    // 处理开始 - 发送"正在思考"提示
+    this.sessionManager.on('progressStarted', async ({ session, message, progress }) => {
+      console.log(`[Agent] Processing started in ${session.name || session.chatId}: ${message.content.text?.substring(0, 50)}...`);
+      
+      const receiveId = session.chatType === 'private' 
+        ? (session.lastSender?.userId || session.chatId)
+        : session.chatId;
+      
+      // 发送"正在思考"的临时卡片
+      const card = CardBuilder.buildProgressCard({
+        thought: '',
+        toolCalls: [],
+        message: '🤔 正在分析问题...',
+        isComplete: false,
+      });
+      
+      const messageId = await this.sendInteractiveCard(receiveId, session.chatType, card);
+      if (messageId) {
+        // 保存消息ID用于后续更新
+        (progress as any)._feishuMessageId = messageId;
+        (progress as any)._feishuReceiveId = receiveId;
+        (progress as any)._feishuChatType = session.chatType;
+      }
+    });
+
+    // 进度更新 - 可以实时更新思考过程（可选）
+    this.sessionManager.on('progressUpdated', async ({ session, message, progress }) => {
+      // 这里可以选择实时更新卡片，但考虑到性能，只在完成时更新一次
+      console.log(`[Agent] Progress updated: ${progress.toolCalls.length} tool calls, thought: ${progress.thought.length} chars`);
+    });
+
+    // 处理完成 - 发送最终结果卡片
+    this.sessionManager.on('replyWithProgress', async ({ session, message, progress }) => {
+      const receiveId = session.chatType === 'private' 
+        ? (session.lastSender?.userId || session.chatId)
+        : session.chatId;
+      
+      const duration = progress.endTime && progress.startTime 
+        ? progress.endTime - progress.startTime 
+        : undefined;
+      
+      // 构建完整卡片（包含思考过程、工具调用和最终结果）
+      const card = CardBuilder.buildProgressCard({
+        thought: progress.thought,
+        toolCalls: progress.toolCalls.map((tc: { name: string; params?: Record<string, unknown>; result?: string }) => ({
+          name: tc.name,
+          params: tc.params,
+          result: tc.result,
+        })),
+        message,
+        isComplete: true,
+        duration,
+      });
+      
+      // 如果有之前保存的消息ID，尝试更新卡片
+      const prevMessageId = (progress as any)._feishuMessageId;
+      if (prevMessageId) {
+        await this.updateInteractiveCard(
+          prevMessageId,
+          (progress as any)._feishuReceiveId || receiveId,
+          (progress as any)._feishuChatType || session.chatType,
+          card
+        );
+      } else {
+        // 否则发送新卡片
+        await this.sendInteractiveCard(receiveId, session.chatType, card);
+      }
     });
 
     this.sessionManager.on('processingError', async ({ session, error }) => {
@@ -110,7 +180,10 @@ export class FeishuAcpAgent {
       const receiveId = session.chatType === 'private' 
         ? (session.lastSender?.userId || session.chatId)
         : session.chatId;
-      await this.sendTextMessage(receiveId, session.chatType, `❌ 处理失败: ${(error as Error).message}`);
+      
+      // 发送错误卡片
+      const card = CardBuilder.buildErrorCard(`❌ 处理失败: ${(error as Error).message}`);
+      await this.sendInteractiveCard(receiveId, session.chatType, card);
     });
 
     // 需要绑定事件
@@ -208,6 +281,23 @@ export class FeishuAcpAgent {
     
     console.log(`[Agent] Message received: type=${chatType}, msg_type=${messageType}, chat_id=${chatId.substring(0, 16)}...`);
 
+    // 消息去重检查
+    const now = Date.now();
+    if (this.processedMessages.has(messageId)) {
+      console.log(`[Agent] ⚠️ Duplicate message detected, skipping: ${messageId.substring(0, 20)}...`);
+      return;
+    }
+    
+    // 清理过期的去重记录
+    for (const [id, timestamp] of this.processedMessages.entries()) {
+      if (now - timestamp > this.MESSAGE_DEDUP_WINDOW) {
+        this.processedMessages.delete(id);
+      }
+    }
+    
+    // 记录消息ID
+    this.processedMessages.set(messageId, now);
+
     // 获取聊天信息
     let chatName: string | undefined;
     try {
@@ -290,6 +380,11 @@ export class FeishuAcpAgent {
         message.content,
         chatName
       );
+    } catch (error) {
+      console.error('[Agent] Error processing message:', error);
+      // 发送错误消息给用户
+      const receiveId = chatType === 'private' ? senderId : chatId;
+      await this.sendTextMessage(receiveId, chatType, `❌ 处理消息时出错: ${(error as Error).message}`);
     } finally {
       this.processingMessages.delete(messageId);
       await this.reactionManager.removeTypingReaction(messageId);
@@ -467,6 +562,14 @@ export class FeishuAcpAgent {
         );
         break;
 
+      case '/reset':
+        this.sessionManager.resetSession(chatId);
+        await this.sendTextMessage(receiveId, 'private', 
+          '🔄 **会话已重置**\n\n' +
+          'ACP 会话上下文已清除，下次对话将使用新会话。'
+        );
+        break;
+
       default:
         // 未知命令也转发给 Kimi 处理
         this.sessionManager.enqueueMessage(
@@ -527,7 +630,16 @@ export class FeishuAcpAgent {
           `📊 **群聊状态**\n\n` +
           `绑定路径：${bindPath ? '`' + bindPath + '`' : '未绑定'}\n` +
           `消息队列：${session?.messageQueue.length || 0} 条待处理\n` +
-          `媒体缓存：${session?.pendingMedia.length || 0} 个文件`
+          `媒体缓存：${session?.pendingMedia.length || 0} 个文件\n` +
+          `ACP会话：${session?.acpSessionId ? '已建立' : '未建立'}`
+        );
+        break;
+
+      case '/reset':
+        this.sessionManager.resetSession(chatId);
+        await this.sendTextMessage(chatId, 'group', 
+          '🔄 **会话已重置**\n\n' +
+          'ACP 会话上下文已清除，下次对话将使用新会话。'
         );
         break;
 
@@ -538,11 +650,13 @@ export class FeishuAcpAgent {
           '`/bind /path` - 绑定工作目录\n' +
           '`/bind` - 查看当前绑定\n' +
           '`/status` - 查看状态\n' +
+          '`/reset` - 重置会话（清除上下文）\n' +
           '`/help` - 显示帮助\n\n' +
           '**使用说明：**\n' +
           '1. 首次使用需要绑定工作目录\n' +
           '2. 绑定后直接发送消息即可对话\n' +
-          '3. 不需要 @机器人'
+          '3. 不需要 @机器人\n' +
+          '4. 如遇回复包含历史消息，请使用 `/reset` 重置会话'
         );
         break;
 
@@ -602,6 +716,130 @@ export class FeishuAcpAgent {
       console.log(`[Agent] Message sent successfully`);
     } catch (error) {
       console.error('[Agent] Failed to send text message:', error);
+    }
+  }
+
+  /**
+   * 发送交互式卡片消息（支持 Markdown 渲染）
+   * 
+   * @param receiveId 接收者ID
+   * @param chatType 聊天类型
+   * @param card 卡片内容
+   * @returns 消息ID（用于后续更新）
+   */
+  private async sendInteractiveCard(
+    receiveId: string,
+    chatType: 'private' | 'group',
+    card: Record<string, unknown>
+  ): Promise<string | null> {
+    try {
+      const receiveIdType = chatType === 'private' ? 'open_id' : 'chat_id';
+
+      console.log(`[Agent] Sending interactive card to ${chatType}: ${receiveIdType}=${receiveId.substring(0, 16)}...`);
+
+      const response = await this.feishuClient.im.message.create({
+        params: { receive_id_type: receiveIdType },
+        data: {
+          receive_id: receiveId,
+          // 使用标准卡片格式（非模板方式）
+          content: JSON.stringify(card),
+          msg_type: 'interactive',
+        },
+      });
+
+      console.log(`[Agent] Interactive card sent successfully`);
+      
+      // 返回消息ID（如果API返回）
+      if (response.code === 0 && (response.data as any)?.message_id) {
+        return (response.data as any).message_id;
+      }
+      return null;
+    } catch (error) {
+      console.error('[Agent] Failed to send interactive card:', error);
+      // 失败后回退到富文本消息
+      await this.sendRichTextMessage(receiveId, chatType, '❌ 无法发送卡片消息，请检查权限设置');
+      return null;
+    }
+  }
+
+  /**
+   * 更新交互式卡片消息
+   * 
+   * @param messageId 消息ID
+   * @param receiveId 接收者ID
+   * @param chatType 聊天类型
+   * @param card 新的卡片内容
+   */
+  private async updateInteractiveCard(
+    messageId: string,
+    receiveId: string,
+    chatType: 'private' | 'group',
+    card: Record<string, unknown>
+  ): Promise<void> {
+    try {
+      console.log(`[Agent] Updating interactive card: ${messageId.substring(0, 16)}...`);
+
+      await this.feishuClient.im.message.patch({
+        path: { message_id: messageId },
+        data: {
+          content: JSON.stringify(card),
+        },
+      });
+
+      console.log(`[Agent] Interactive card updated successfully`);
+    } catch (error) {
+      console.error('[Agent] Failed to update interactive card:', error);
+      // 更新失败时，发送新消息
+      await this.sendInteractiveCard(receiveId, chatType, card);
+    }
+  }
+
+  /**
+   * 发送富文本消息（支持 Markdown 渲染）
+   * 当卡片消息不可用时作为后备方案
+   * 
+   * @param receiveId 接收者ID
+   * @param chatType 聊天类型
+   * @param text 消息内容（支持 Markdown）
+   */
+  private async sendRichTextMessage(
+    receiveId: string,
+    chatType: 'private' | 'group',
+    text: string
+  ): Promise<void> {
+    try {
+      const receiveIdType = chatType === 'private' ? 'open_id' : 'chat_id';
+
+      console.log(`[Agent] Sending rich text message to ${chatType}: ${receiveIdType}=${receiveId.substring(0, 16)}...`);
+
+      // 构建富文本内容（支持 Markdown）
+      const postContent = {
+        zh_cn: {
+          title: '',
+          content: [
+            [
+              {
+                tag: 'text',
+                text: text,
+              },
+            ],
+          ],
+        },
+      };
+
+      await this.feishuClient.im.message.create({
+        params: { receive_id_type: receiveIdType },
+        data: {
+          receive_id: receiveId,
+          content: JSON.stringify(postContent),
+          msg_type: 'post',
+        },
+      });
+      console.log(`[Agent] Rich text message sent successfully`);
+    } catch (error) {
+      console.error('[Agent] Failed to send rich text message:', error);
+      // 最后回退到纯文本
+      await this.sendTextMessage(receiveId, chatType, text);
     }
   }
 
