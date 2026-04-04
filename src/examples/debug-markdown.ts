@@ -1,11 +1,6 @@
 /**
- * Markdown 渲染调试工具 - 最终版
- * 明确展示飞书不同消息类型的 Markdown 支持差异
- * 
- * 重要结论：
- * 1. 纯文本(text) - ❌ 完全不支持 Markdown，会显示原始符号 ## | ** 等
- * 2. 富文本(post) - ⚠️  支持有限，需手动解析为飞书格式
- * 3. 卡片(interactive) - ✅ 支持结构化组件，但 lark_md 仅支持粗体/斜体等简单语法
+ * Markdown 渲染调试工具 - 富文本版
+ * 将 Markdown 转换为飞书富文本格式 (post message)
  */
 
 import * as dotenv from 'dotenv';
@@ -38,8 +33,230 @@ if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
     process.exit(1);
 }
 
+/**
+ * Markdown 转飞书富文本转换器
+ */
+class MarkdownToFeishuConverter {
+    /**
+     * 将 Markdown 转换为飞书 post 格式
+     */
+    convert(markdown: string): any {
+        const lines = markdown.split('\n');
+        const paragraphs: any[][] = [];
+        let i = 0;
+
+        while (i < lines.length) {
+            const line = lines[i].trim();
+
+            // 空行跳过
+            if (line === '') {
+                i++;
+                continue;
+            }
+
+            // 一级标题 # Title
+            if (line.startsWith('# ') && !line.startsWith('## ')) {
+                paragraphs.push([{
+                    tag: 'text',
+                    text: line.substring(2),
+                    style: { bold: true, fontsize: 3 },
+                }]);
+                i++;
+                continue;
+            }
+
+            // 二级标题 ## Title
+            if (line.startsWith('## ') && !line.startsWith('### ')) {
+                paragraphs.push([{
+                    tag: 'text',
+                    text: line.substring(3),
+                    style: { bold: true, fontsize: 2 },
+                }]);
+                i++;
+                continue;
+            }
+
+            // 三级标题 ### Title
+            if (line.startsWith('### ')) {
+                paragraphs.push([{
+                    tag: 'text',
+                    text: line.substring(4),
+                    style: { bold: true, fontsize: 1 },
+                }]);
+                i++;
+                continue;
+            }
+
+            // 引用 > text
+            if (line.startsWith('> ')) {
+                paragraphs.push([{
+                    tag: 'text',
+                    text: '💡 ' + line.substring(2),
+                    style: { italic: true, bold: false },
+                }]);
+                i++;
+                continue;
+            }
+
+            // 分割线 ---
+            if (line === '---' || line === '***') {
+                // 飞书 post 不支持 hr，用空行代替
+                i++;
+                continue;
+            }
+
+            // 表格处理
+            if (line.includes('|')) {
+                const tableLines: string[] = [];
+                while (i < lines.length && lines[i].trim().includes('|')) {
+                    tableLines.push(lines[i].trim());
+                    i++;
+                }
+
+                const tableContent = this.parseTable(tableLines);
+                if (tableContent) {
+                    paragraphs.push(tableContent);
+                }
+                continue;
+            }
+
+            // 列表项 - item
+            if (line.startsWith('- ') || line.startsWith('* ')) {
+                const text = line.substring(2);
+                const elements = this.parseInlineMarkdown(text);
+                // 添加列表符号
+                elements.unshift({ tag: 'text', text: '• ' });
+                paragraphs.push(elements);
+                i++;
+                continue;
+            }
+
+            // 普通段落
+            paragraphs.push(this.parseInlineMarkdown(line));
+            i++;
+        }
+
+        return {
+            zh_cn: {
+                title: '📈 富文本消息测试',
+                content: paragraphs,
+            },
+        };
+    }
+
+    /**
+     * 解析表格
+     */
+    private parseTable(lines: string[]): any[] | null {
+        // 过滤掉分隔行 |---|---|
+        const dataLines = lines.filter(line => !line.match(/^\|[-:\s|]+\|$/));
+        if (dataLines.length === 0) return null;
+
+        const elements: any[] = [];
+
+        // 表头（第一行）
+        const headerLine = dataLines[0];
+        const headers = headerLine.split('|').map(c => c.trim()).filter(c => c);
+        if (headers.length > 0) {
+            elements.push({
+                tag: 'text',
+                text: headers.join('  |  '),
+                style: { bold: true },
+            });
+        }
+
+        // 数据行
+        for (let i = 1; i < dataLines.length; i++) {
+            const cells = dataLines[i].split('|').map(c => c.trim()).filter(c => c);
+            if (cells.length > 0) {
+                // 解析每个单元格的行内 Markdown
+                const cellElements: any[] = [];
+                cells.forEach((cell, index) => {
+                    if (index > 0) {
+                        cellElements.push({ tag: 'text', text: '  |  ' });
+                    }
+                    // 解析单元格内的粗体
+                    const inlineElements = this.parseInlineMarkdown(cell, false);
+                    cellElements.push(...inlineElements);
+                });
+                elements.push(...cellElements);
+            }
+        }
+
+        return elements;
+    }
+
+    /**
+     * 解析行内 Markdown（粗体、斜体、代码）
+     */
+    private parseInlineMarkdown(text: string, addNewline: boolean = true): any[] {
+        const elements: any[] = [];
+        let remaining = text;
+
+        // 处理 **粗体** 和 *斜体*
+        const pattern = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g;
+        let lastIndex = 0;
+        let match;
+
+        while ((match = pattern.exec(text)) !== null) {
+            // 添加匹配前的普通文本
+            if (match.index > lastIndex) {
+                elements.push({
+                    tag: 'text',
+                    text: text.substring(lastIndex, match.index),
+                });
+            }
+
+            const content = match[0];
+            if (content.startsWith('**') && content.endsWith('**')) {
+                // 粗体
+                elements.push({
+                    tag: 'text',
+                    text: content.slice(2, -2),
+                    style: { bold: true },
+                });
+            } else if (content.startsWith('*') && content.endsWith('*')) {
+                // 斜体
+                elements.push({
+                    tag: 'text',
+                    text: content.slice(1, -1),
+                    style: { italic: true },
+                });
+            } else if (content.startsWith('`') && content.endsWith('`')) {
+                // 代码
+                elements.push({
+                    tag: 'text',
+                    text: content.slice(1, -1),
+                    style: { code: true },
+                });
+            }
+
+            lastIndex = match.index + content.length;
+        }
+
+        // 添加剩余文本
+        if (lastIndex < text.length) {
+            elements.push({
+                tag: 'text',
+                text: text.substring(lastIndex),
+            });
+        }
+
+        // 如果没有匹配到任何格式，返回原文
+        if (elements.length === 0) {
+            elements.push({ tag: 'text', text: text });
+        }
+
+        return elements;
+    }
+}
+
+/**
+ * 飞书客户端
+ */
 class FeishuClient {
     private client: lark.Client;
+    private converter: MarkdownToFeishuConverter;
 
     constructor() {
         this.client = new lark.Client({
@@ -48,15 +265,38 @@ class FeishuClient {
             appType: lark.AppType.SelfBuild,
             domain: lark.Domain.Feishu,
         });
+        this.converter = new MarkdownToFeishuConverter();
     }
 
     /**
-     * 测试1: 纯文本消息 - ❌ 不支持 Markdown
-     * 结果：会原样显示 ## ** | 等符号
+     * 发送富文本消息（post）
      */
-    async test1_Text() {
-        console.log('[Test 1] 纯文本消息 (text) - 不支持 Markdown');
-        console.log('         预期：显示原始符号 ## ** | 等');
+    async sendPostMessage(title: string, markdown: string) {
+        console.log('[Test] 发送富文本消息 (post)...');
+        
+        const postContent = this.converter.convert(markdown);
+        postContent.zh_cn.title = title;
+
+        try {
+            await this.client.im.message.create({
+                params: { receive_id_type: 'open_id' },
+                data: {
+                    receive_id: TARGET_USER_ID,
+                    msg_type: 'post',
+                    content: JSON.stringify(postContent),
+                },
+            });
+            console.log('✅ 富文本消息发送成功\n');
+        } catch (error) {
+            console.error('❌ 发送失败:', error);
+        }
+    }
+
+    /**
+     * 发送纯文本消息（对比用）
+     */
+    async sendTextMessage(text: string) {
+        console.log('[Test] 发送纯文本消息 (text) - 对比用...');
         
         try {
             await this.client.im.message.create({
@@ -64,95 +304,20 @@ class FeishuClient {
                 data: {
                     receive_id: TARGET_USER_ID,
                     msg_type: 'text',
-                    content: JSON.stringify({ text: TEST_MARKDOWN }),
+                    content: JSON.stringify({ text }),
                 },
             });
-            console.log('         ✅ 发送成功\n');
+            console.log('✅ 纯文本消息发送成功\n');
         } catch (error) {
-            console.error('         ❌ 失败:', error);
+            console.error('❌ 发送失败:', error);
         }
     }
 
     /**
-     * 测试2: 富文本消息 - ⚠️ 有限支持
-     * 需要手动将 Markdown 转换为飞书的 post 格式
+     * 发送结构化卡片（最佳效果）
      */
-    async test2_Post() {
-        console.log('[Test 2] 富文本消息 (post) - 有限支持');
-        console.log('         说明：手动解析 Markdown 为飞书格式');
-        
-        // 手动解析 Markdown 为飞书 post 格式
-        const postContent = this.parseMarkdownToPost(TEST_MARKDOWN);
-        
-        try {
-            await this.client.im.message.create({
-                params: { receive_id_type: 'open_id' },
-                data: {
-                    receive_id: TARGET_USER_ID,
-                    msg_type: 'post',
-                    content: JSON.stringify({
-                        zh_cn: {
-                            title: '📈 富文本消息测试 (Post)',
-                            content: postContent,
-                        },
-                    }),
-                },
-            });
-            console.log('         ✅ 发送成功\n');
-        } catch (error) {
-            console.error('         ❌ 失败:', error);
-        }
-    }
-
-    /**
-     * 测试3: 卡片消息 - lark_md 简单语法支持
-     * 仅支持 **粗体** *斜体* `代码` [链接](url) <at> 等简单语法
-     * 不支持 ##标题 |表格|
-     */
-    async test3_Card_LarkMd() {
-        console.log('[Test 3] 卡片消息 - lark_md 简单语法');
-        console.log('         说明：仅支持 **粗体** *斜体* `代码` [链接] <at>');
-        console.log('         不支持：##标题 |表格| >引用');
-        
-        const card = {
-            config: { wide_screen_mode: true },
-            header: {
-                title: { tag: 'plain_text', content: 'lark_md 简单语法测试' },
-                template: 'orange',
-            },
-            elements: [
-                {
-                    tag: 'div',
-                    text: {
-                        tag: 'lark_md',
-                        content: TEST_MARKDOWN, // 直接用原始 Markdown 测试
-                    },
-                },
-            ],
-        };
-
-        try {
-            await this.client.im.message.create({
-                params: { receive_id_type: 'open_id' },
-                data: {
-                    receive_id: TARGET_USER_ID,
-                    msg_type: 'interactive',
-                    content: JSON.stringify(card),
-                },
-            });
-            console.log('         ✅ 发送成功\n');
-        } catch (error) {
-            console.error('         ❌ 失败:', error);
-        }
-    }
-
-    /**
-     * 测试4: 卡片消息 - 结构化组件 ✅ 推荐方案
-     * 使用 column_set, div, note 等组件实现类似效果
-     */
-    async test4_Card_Structured() {
-        console.log('[Test 4] 卡片消息 - 结构化组件 (推荐)');
-        console.log('         说明：使用 column_set 实现表格，div 实现标题');
+    async sendStructuredCard() {
+        console.log('[Test] 发送结构化卡片 (interactive) - 最佳效果...');
         
         const card = {
             config: { wide_screen_mode: true },
@@ -161,13 +326,13 @@ class FeishuClient {
                 template: 'green',
             },
             elements: [
-                // 二级标题
+                // 标题
                 {
                     tag: 'div',
                     text: { tag: 'plain_text', content: '一、A股市场整体情况', style: { bold: true, fontsize: 2 } },
                 },
                 { tag: 'hr' },
-                // 列表项（使用 lark_md 支持粗体）
+                // 列表
                 {
                     tag: 'div',
                     text: { tag: 'lark_md', content: '• **上证指数**: 约3880点，近期下跌约1%' },
@@ -177,12 +342,12 @@ class FeishuClient {
                     text: { tag: 'lark_md', content: '• **超大盘指数**: 2458.69点，下跌0.76%' },
                 },
                 { tag: 'hr' },
-                // 二级标题
+                // 标题
                 {
                     tag: 'div',
                     text: { tag: 'plain_text', content: '二、国际油价影响', style: { bold: true, fontsize: 2 } },
                 },
-                // 表格 - 使用 column_set
+                // 表格
                 {
                     tag: 'column_set',
                     flex_mode: 'stretch',
@@ -221,13 +386,13 @@ class FeishuClient {
                     ],
                 },
                 { tag: 'hr' },
-                // 引用 - 使用 note
+                // 引用
                 {
                     tag: 'note',
                     elements: [{ tag: 'plain_text', content: '💡 注意：以上数据仅供参考，投资有风险' }],
                 },
                 { tag: 'hr' },
-                // 总结 - lark_md 粗体
+                // 总结
                 {
                     tag: 'div',
                     text: { tag: 'lark_md', content: '**总结**: 建议关注政策动向和海外市场变化。' },
@@ -244,78 +409,10 @@ class FeishuClient {
                     content: JSON.stringify(card),
                 },
             });
-            console.log('         ✅ 发送成功\n');
+            console.log('✅ 结构化卡片发送成功\n');
         } catch (error) {
-            console.error('         ❌ 失败:', error);
+            console.error('❌ 发送失败:', error);
         }
-    }
-
-    /**
-     * 将 Markdown 解析为飞书 post 格式
-     */
-    private parseMarkdownToPost(markdown: string): any[][] {
-        const lines = markdown.split('\n');
-        const paragraphs: any[][] = [];
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-            if (line === '') continue;
-
-            // 标题
-            if (line.startsWith('### ')) {
-                paragraphs.push([{ tag: 'text', text: line.substring(4), style: { bold: true, fontsize: 1 } }]);
-                continue;
-            }
-            if (line.startsWith('## ')) {
-                paragraphs.push([{ tag: 'text', text: line.substring(3), style: { bold: true, fontsize: 2 } }]);
-                continue;
-            }
-
-            // 列表项 - 手动解析粗体
-            if (line.startsWith('- ') || line.startsWith('* ')) {
-                const text = line.substring(2);
-                const elements = this.parseInlineStyles(text, '• ');
-                paragraphs.push(elements);
-                continue;
-            }
-
-            // 表格行（简化）
-            if (line.includes('|') && !line.match(/^\|[-:\s|]+\|$/)) {
-                const cells = line.split('|').map(c => c.trim()).filter(c => c);
-                paragraphs.push([{ tag: 'text', text: cells.join('  |  '), style: { bold: true } }]);
-                continue;
-            }
-
-            // 引用
-            if (line.startsWith('> ')) {
-                paragraphs.push([{ tag: 'text', text: line.substring(2), style: { italic: true } }]);
-                continue;
-            }
-
-            // 普通文本
-            paragraphs.push(this.parseInlineStyles(line));
-        }
-
-        return paragraphs;
-    }
-
-    private parseInlineStyles(text: string, prefix: string = ''): any[] {
-        const elements: any[] = [];
-        if (prefix) {
-            elements.push({ tag: 'text', text: prefix });
-        }
-
-        // 简单的 **粗体** 解析
-        const parts = text.split(/(\*\*.*?\*\*)/g);
-        for (const part of parts) {
-            if (part.startsWith('**') && part.endsWith('**')) {
-                elements.push({ tag: 'text', text: part.slice(2, -2), style: { bold: true } });
-            } else if (part) {
-                elements.push({ tag: 'text', text: part });
-            }
-        }
-
-        return elements.length > 0 ? elements : [{ tag: 'text', text: prefix + text }];
     }
 }
 
@@ -323,29 +420,27 @@ class FeishuClient {
 
 async function main() {
     console.log('========================================');
-    console.log('  飞书 Markdown 渲染测试 - 最终版');
+    console.log('  富文本 Markdown 渲染测试');
     console.log('========================================\n');
-    console.log('重要结论：');
-    console.log('• 纯文本(text): ❌ 完全不支持 Markdown');
-    console.log('• 富文本(post): ⚠️  有限支持，需手动转换');
-    console.log('• 卡片(interactive): ✅ 结构化组件效果最佳\n');
-    console.log(`目标用户: ${TARGET_USER_ID}\n`);
 
     const feishu = new FeishuClient();
 
-    await feishu.test1_Text();
+    // 1. 纯文本（对比）
+    console.log('--- 1. 纯文本消息（显示原始符号）---');
+    await feishu.sendTextMessage(TEST_MARKDOWN);
     await sleep(1500);
 
-    await feishu.test2_Post();
+    // 2. 富文本（基础转换）
+    console.log('--- 2. 富文本消息（Markdown 转换）---');
+    await feishu.sendPostMessage('富文本测试', TEST_MARKDOWN);
     await sleep(1500);
 
-    await feishu.test3_Card_LarkMd();
-    await sleep(1500);
-
-    await feishu.test4_Card_Structured();
+    // 3. 结构化卡片（最佳效果）
+    console.log('--- 3. 结构化卡片（组件实现）---');
+    await feishu.sendStructuredCard();
 
     console.log('========================================');
-    console.log('所有测试已发送，请在飞书查看效果对比');
+    console.log('测试完成，请在飞书查看效果');
     console.log('========================================');
 }
 
