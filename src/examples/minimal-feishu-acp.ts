@@ -1,6 +1,5 @@
 /**
- * 飞书 ACP Agent - 精简版（状态切换时立即发送）
- * 思考 ↔ 工具调用 穿插进行时，类型变化立即发送之前内容
+ * 飞书 ACP Agent - 修复并发重复问题
  */
 
 import * as dotenv from 'dotenv';
@@ -13,8 +12,6 @@ import {
     type RequestPermissionRequest,
     type RequestPermissionResponse,
     type SessionNotification,
-    type NewSessionRequest,
-    type PromptRequest,
 } from '@agentclientprotocol/sdk';
 import { spawn } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
@@ -35,32 +32,23 @@ if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
     process.exit(1);
 }
 
-// ============ 类型定义 ============
-
-type StreamType = 'thinking' | 'tool' | 'message';
-
-interface StreamContext {
-    currentType: StreamType | null;
-    thinkingBuffer: string;
-    toolCalls: ToolCallInfo[];
-    messageBuffer: string;
+// ============ Session 状态 ============
+interface SessionState {
+    sessionId: string;
     receiverId: string;
-    // 各类型是否已发送
-    thinkingSent: boolean;
-    toolsSent: boolean;
+    thinkingBuffer: string;
+    messageBuffer: string;
+    sentToolIds: Set<string>;
+    phase: 'thinking' | 'tool' | 'message';
+    // 防重入锁
+    isFlushingThinking: boolean;
 }
 
-interface ToolCallInfo {
-    name: string;
-    params?: Record<string, unknown>;
-    timestamp: number;
-}
+const activeSessions = new Map<string, SessionState>();
 
 // ============ ACP 客户端 ============
-
 class AcpClient implements Client {
     private connection?: ClientSideConnection;
-    private context?: StreamContext;
 
     async connect(agentPath: string = 'kimi') {
         const childProcess = spawn(agentPath, ['acp'], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -84,152 +72,140 @@ class AcpClient implements Client {
     }
 
     async sessionUpdate(params: SessionNotification): Promise<void> {
-        if (!this.context) return;
-
         const notification = params as any;
+        const sessionId = notification.sessionId;
         const updateType = notification.update?.sessionUpdate;
         const content = notification.update?.content?.text;
+        
+        const state = activeSessions.get(sessionId);
+        if (!state) return;
 
         switch (updateType) {
             case 'agent_thought_chunk':
-                await this.handleThinking(content);
+                if (content) {
+                    state.phase = 'thinking';
+                    state.thinkingBuffer += content;
+                }
                 break;
+
             case 'tool_call':
-                await this.handleToolCall(notification);
+                console.log('\n[RAW TOOL_CALL]', JSON.stringify(notification.update, null, 2).substring(0, 600));
+                await this.handleToolCall(state, notification);
                 break;
+
             case 'agent_message_chunk':
-                if (content) this.context.messageBuffer += content;
+                if (content) {
+                    state.messageBuffer += content;
+                }
                 break;
         }
     }
 
-    /**
-     * 处理思考片段
-     */
-    private async handleThinking(content: string): Promise<void> {
-        if (!this.context) return;
+    private async handleToolCall(state: SessionState, notification: any): Promise<void> {
+        const update = notification.update || {};
+        const toolId = update.toolCallId;
         
-        // 如果之前是工具调用状态，先把工具调用发送出去
-        if (this.context.currentType === 'tool' && !this.context.toolsSent) {
-            await this.flushToolCalls();
+        if (!toolId || state.sentToolIds.has(toolId)) {
+            console.log(`[Tool] Skip dup/empty: ${toolId?.substring(0, 20)}...`);
+            return;
         }
+        state.sentToolIds.add(toolId);
 
-        this.context.currentType = 'thinking';
-        this.context.thinkingBuffer += content;
+        const toolName = update.title || 'Unknown';
         
-        // 实时更新思考显示
-        console.log(`[Thinking] ${content.substring(0, 50)}`);
-    }
-
-    /**
-     * 处理工具调用
-     */
-    private async handleToolCall(notification: any): Promise<void> {
-        if (!this.context) return;
-
-        // 如果之前是思考状态，先把思考内容发送出去
-        if (this.context.currentType === 'thinking' && !this.context.thinkingSent) {
-            await this.flushThinking();
+        // 尝试所有可能的参数字段
+        const params = update.input || update.parameters || update.params || 
+                      update.arguments || update.args || update.data || {};
+        
+        // 如果没找到，尝试从 content 解析（有些协议把参数放 content 里）
+        let finalParams = params;
+        if (Object.keys(params).length === 0 && update.content) {
+            try {
+                const contentText = update.content[0]?.content?.text;
+                if (contentText) {
+                    finalParams = JSON.parse(contentText);
+                }
+            } catch {
+                finalParams = { query: update.content[0]?.content?.text };
+            }
         }
-
-        this.context.currentType = 'tool';
-
-        // 解析工具调用（打印完整信息）
-        console.log('[ACP] 🔍 Raw tool_call:', JSON.stringify(notification, null, 2));
         
-        const tc = notification.toolCall || notification;
-        const name = tc.title || tc.name || tc.tool || 'Unknown Tool';
-        const params = notification.params || tc.params || {};
+        console.log(`[Tool] ${toolName} | params: ${JSON.stringify(finalParams).substring(0, 100)}`);
 
-        this.context.toolCalls.push({ name, params, timestamp: Date.now() });
-        
-        // 立即发送这个工具调用
-        const displayText = `🔧 **${name}**\n\`$${JSON.stringify(params).substring(0, 300)}\``;
-        await sendTextCard(this.context.receiverId, '工具调用', displayText);
-        this.context.toolsSent = true;
-        
-        console.log(`[Tool] ${name}`);
-    }
-
-    /**
-     * 发送累积的思考内容
-     */
-    private async flushThinking(): Promise<void> {
-        if (!this.context || this.context.thinkingSent) return;
-        
-        const content = this.context.thinkingBuffer.trim();
-        if (content) {
-            await sendTextCard(
-                this.context.receiverId,
-                '💭 思考过程',
-                content.substring(0, 2000)
-            );
-            console.log(`[Flush] Thinking: ${content.length} chars`);
+        // 切换前 flush 思考（带锁防止并发重复）
+        if (state.phase === 'thinking' && state.thinkingBuffer.trim() && !state.isFlushingThinking) {
+            await this.flushThinking(state);
         }
-        this.context.thinkingSent = true;
+        state.phase = 'tool';
+
+        // 发送工具卡片
+        const display = `**${toolName}**\n\`$${JSON.stringify(finalParams).substring(0, 300)}\``;
+        await sendTextCard(state.receiverId, '🔧 工具调用', display);
     }
 
-    /**
-     * 发送累积的工具调用
-     */
-    private async flushToolCalls(): Promise<void> {
-        if (!this.context || this.context.toolsSent) return;
+    private async flushThinking(state: SessionState): Promise<void> {
+        // 加锁：防止并发重复 flush
+        if (state.isFlushingThinking) {
+            console.log('[Flush] Already flushing, skip');
+            return;
+        }
+        state.isFlushingThinking = true;
 
-        // 工具调用是实时发送的，这里只是标记
-        console.log(`[Flush] ${this.context.toolCalls.length} tool calls`);
-        this.context.toolsSent = true;
+        try {
+            // 立即提取并清空 buffer（防止并发读取相同内容）
+            const content = state.thinkingBuffer.trim();
+            state.thinkingBuffer = ''; // 立即清空！
+
+            if (!content) {
+                console.log('[Flush] Empty after clear, skip');
+                return;
+            }
+
+            console.log(`[Flush] ${content.length} chars: "${content.substring(0, 50).replace(/\n/g, '\\n')}..."`);
+            await sendTextCard(state.receiverId, '💭 思考过程', content.substring(0, 3000));
+        } finally {
+            state.isFlushingThinking = false;
+        }
     }
 
-    async newSession() {
-        const response = await this.connection!.newSession({
-            cwd: WORK_PATH,
-            mcpServers: [],
-        });
-        return response.sessionId;
+    async newSession(): Promise<string> {
+        const resp = await this.connection!.newSession({ cwd: WORK_PATH, mcpServers: [] });
+        return resp.sessionId;
     }
 
-    /**
-     * 流式发送
-     */
     async sendMessageStream(
         sessionId: string,
         prompt: string,
         receiverId: string
     ): Promise<string> {
-        this.context = {
-            currentType: null,
-            thinkingBuffer: '',
-            toolCalls: [],
-            messageBuffer: '',
-            receiverId,
-            thinkingSent: false,
-            toolsSent: false,
+        const state: SessionState = {
+            sessionId, receiverId,
+            thinkingBuffer: '', messageBuffer: '',
+            sentToolIds: new Set(),
+            phase: 'message',
+            isFlushingThinking: false,
         };
+        activeSessions.set(sessionId, state);
 
-        await this.connection!.prompt({
-            sessionId,
-            prompt: [{ type: 'text', text: prompt }],
-        });
+        try {
+            await this.connection!.prompt({
+                sessionId,
+                prompt: [{ type: 'text', text: prompt }],
+            });
 
-        // 结束前确保所有内容都已发送
-        if (this.context.currentType === 'thinking' && !this.context.thinkingSent) {
-            await this.flushThinking();
+            // 最后 flush（带锁）
+            if (state.thinkingBuffer.trim() && !state.isFlushingThinking) {
+                await this.flushThinking(state);
+            }
+
+            return state.messageBuffer;
+        } finally {
+            activeSessions.delete(sessionId);
         }
-
-        const result = this.context.messageBuffer;
-        const ctx = { ...this.context };
-        this.context = undefined;
-
-        return result;
-    }
-
-    getLastContext() {
-        return this.context;
     }
 }
 
 // ============ 主程序 ============
-
 async function main() {
     const acp = new AcpClient();
     await acp.connect(process.env.ACP_AGENT_PATH || 'kimi');
@@ -245,19 +221,12 @@ async function main() {
             const senderId = data.sender.sender_id.open_id;
             const content = JSON.parse(message.content).text;
 
-            console.log(`\n[User] ${content.substring(0, 50)}`);
+            console.log(`\n[User] ${content}`);
 
             const sessionId = await acp.newSession();
-            const finalReply = await acp.sendMessageStream(sessionId, content, senderId);
+            const reply = await acp.sendMessageStream(sessionId, content, senderId);
 
-            // 发送最终回复
-            const ctx = acp.getLastContext();
-            if (ctx) {
-                await sendFinalCard(senderId, 'Kimi 回复', finalReply, {
-                    thought: ctx.thinkingSent ? '' : ctx.thinkingBuffer,
-                    toolCalls: ctx.toolCalls,
-                });
-            }
+            await sendFinalCard(senderId, '回复', reply);
         },
         'im.message.message_read_v1': async () => {},
     });

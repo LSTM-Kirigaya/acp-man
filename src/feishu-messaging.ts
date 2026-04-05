@@ -1,165 +1,277 @@
 /**
- * 飞书消息发送模块
- * 支持实时流式输出
+ * 飞书消息工具模块 - 支持实时流式卡片
  */
 
 import * as lark from '@larksuiteoapi/node-sdk';
 
-let feishuClient: lark.Client | null = null;
+let larkClient: lark.Client | null = null;
 
-export function initFeishuClient(appId: string, appSecret: string): lark.Client {
-    if (!feishuClient) {
-        feishuClient = new lark.Client({
-            appId, appSecret,
-            appType: lark.AppType.SelfBuild,
-            domain: lark.Domain.Feishu,
-        });
-    }
-    return feishuClient;
+export function initFeishuClient(appId: string, appSecret: string): void {
+    larkClient = new lark.Client({
+        appId,
+        appSecret,
+        appType: lark.AppType.SelfBuild,
+    });
 }
 
-function getClient(): lark.Client {
-    if (!feishuClient) throw new Error('Not initialized');
-    return feishuClient;
+export function getClient(): lark.Client {
+    if (!larkClient) throw new Error('Feishu client not initialized');
+    return larkClient;
 }
+
+// ============ 基础卡片发送 ============
 
 /**
- * 发送简单文本卡片（用于实时显示思考和工具调用）
+ * 发送简单的文本卡片（用于实时流中的独立消息）
  */
 export async function sendTextCard(
     receiveId: string,
     title: string,
     content: string
 ): Promise<void> {
+    const client = getClient();
+    
     const card = {
-        config: { wide_screen_mode: true },
         header: {
-            title: { tag: 'plain_text', content: title },
-            template: title.includes('思考') ? 'blue' : 'orange',
+            template: 'green',
+            title: { tag: 'plain_text', content: title }
         },
         elements: [{
             tag: 'div',
-            text: { tag: 'lark_md', content: content },
-        }],
+            text: { tag: 'lark_md', content: content || '*(无内容)*' }
+        }]
     };
 
-    await getClient().im.message.create({
-        params: { receive_id_type: 'open_id' },
-        data: {
-            receive_id: receiveId,
-            msg_type: 'interactive',
-            content: JSON.stringify(card),
-        },
-    });
+    try {
+        const resp = await client.im.v1.message.create({
+            params: { receive_id_type: 'open_id' },
+            data: {
+                receive_id: receiveId,
+                msg_type: 'interactive',
+                content: JSON.stringify(card),
+            } as any,
+        });
+        if (resp.code !== 0) {
+            console.error('[Feishu] sendTextCard failed:', resp.msg);
+        }
+    } catch (e) {
+        console.error('[Feishu] sendTextCard error:', e);
+    }
 }
 
 /**
- * 发送最终回复卡片（包含完整内容）
+ * 发送结构化卡片（用于最终回复，包含思考、工具、回复等完整信息）
  */
 export async function sendFinalCard(
     receiveId: string,
     title: string,
     content: string,
-    meta?: { thought: string; toolCalls: any[] }
+    options?: {
+        thought?: string;
+        toolCalls?: Array<{ name: string; params?: Record<string, unknown> }>;
+    }
 ): Promise<void> {
+    const client = getClient();
     const elements: any[] = [];
 
-    // 如果有未发送的思考或工具调用，在这里显示摘要
-    if (meta) {
-        const parts: string[] = [];
-        if (meta.thought) parts.push(`💭 ${meta.thought.length} 字符`);
-        if (meta.toolCalls.length) parts.push(`🔧 ${meta.toolCalls.length} 个工具`);
-        if (parts.length) {
-            elements.push({
-                tag: 'div',
-                text: { tag: 'plain_text', content: parts.join('  |  ') },
-            });
-            elements.push({ tag: 'hr' });
-        }
+    // 思考过程（如果之前未发送）
+    if (options?.thought && options.thought.trim()) {
+        elements.push({
+            tag: 'div',
+            text: { tag: 'lark_md', content: `💭 **思考过程**\n> ${options.thought.substring(0, 1500)}` }
+        });
     }
 
-    // 主要内容
-    elements.push(...parseContent(content));
+    // 工具调用记录
+    if (options?.toolCalls && options.toolCalls.length > 0) {
+        elements.push({
+            tag: 'div',
+            text: { tag: 'lark_md', content: `🔧 **已调用工具**\n${options.toolCalls.map(tc => `- ${tc.name}`).join('\n')}` }
+        });
+    }
+
+    // 分隔线
+    if (elements.length > 0) {
+        elements.push({ tag: 'hr' });
+    }
+
+    // 最终回复内容
+    elements.push({
+        tag: 'div',
+        text: { tag: 'lark_md', content: content || '*(无回复内容)*' }
+    });
 
     const card = {
-        config: { wide_screen_mode: true },
         header: {
-            title: { tag: 'plain_text', content: title },
-            template: 'green',
+            template: 'blue',
+            title: { tag: 'plain_text', content: title }
         },
-        elements,
+        elements
     };
 
-    await getClient().im.message.create({
-        params: { receive_id_type: 'open_id' },
-        data: {
-            receive_id: receiveId,
-            msg_type: 'interactive',
-            content: JSON.stringify(card),
+    try {
+        const resp = await client.im.v1.message.create({
+            params: { receive_id_type: 'open_id' },
+            data: {
+                receive_id: receiveId,
+                msg_type: 'interactive',
+                content: JSON.stringify(card),
+            } as any,
+        });
+        if (resp.code !== 0) {
+            console.error('[Feishu] sendFinalCard failed:', resp.msg);
+        }
+    } catch (e) {
+        console.error('[Feishu] sendFinalCard error:', e);
+    }
+}
+
+// ============ 流式卡片更新（进阶） ============
+
+interface StreamCardState {
+    messageId: string;
+    thinking: string;
+    toolCalls: Array<{ name: string; params?: any }>;
+    message: string;
+    thinkingSent: boolean;
+}
+
+const activeStreams = new Map<string, StreamCardState>();
+
+/**
+ * 创建一个新的流式卡片
+ */
+export async function createStreamCard(
+    receiveId: string,
+    title: string
+): Promise<string | null> {
+    const client = getClient();
+
+    const card = {
+        header: {
+            template: 'grey',
+            title: { tag: 'plain_text', content: title }
         },
-    });
+        elements: [{
+            tag: 'div',
+            text: { tag: 'plain_text', content: '⏳ 处理中...' }
+        }]
+    };
+
+    try {
+        const resp = await client.im.v1.message.create({
+            params: { receive_id_type: 'open_id' },
+            data: {
+                receive_id: receiveId,
+                msg_type: 'interactive',
+                content: JSON.stringify(card),
+            } as any,
+        });
+
+        if (resp.code === 0 && resp.data?.message_id) {
+            activeStreams.set(resp.data.message_id, {
+                messageId: resp.data.message_id,
+                thinking: '',
+                toolCalls: [],
+                message: '',
+                thinkingSent: false,
+            });
+            return resp.data.message_id;
+        }
+    } catch (e) {
+        console.error('[Feishu] createStreamCard error:', e);
+    }
+    return null;
 }
 
 /**
- * 解析 Markdown 为卡片元素
+ * 更新流式卡片（如果不支持，则发送新消息）
  */
-function parseContent(markdown: string): any[] {
+export async function updateStreamCard(
+    receiveId: string,
+    state: {
+        thinking?: string;
+        toolCalls?: Array<{ name: string; params?: any }>;
+        message?: string;
+    },
+    messageId?: string | null
+): Promise<string | null> {
+    const client = getClient();
+
+    // 构造新卡片内容
     const elements: any[] = [];
-    const lines = markdown.split('\n');
-    let i = 0;
 
-    while (i < lines.length) {
-        const line = lines[i].trim();
-        if (!line) { i++; continue; }
-
-        // 标题
-        if (line.startsWith('### ')) {
-            elements.push({ tag: 'div', text: { tag: 'plain_text', content: line.substring(4) } });
-        } else if (line.startsWith('## ')) {
-            elements.push({ tag: 'div', text: { tag: 'plain_text', content: line.substring(3) } });
-        } else if (line.startsWith('# ')) {
-            elements.push({ tag: 'div', text: { tag: 'plain_text', content: line.substring(2) } });
-        }
-        // 表格
-        else if (line.includes('|')) {
-            const rows: string[][] = [];
-            while (i < lines.length && lines[i].includes('|')) {
-                const cells = lines[i].split('|').map(c => c.trim()).filter(c => c && !c.match(/^-+$/));
-                if (cells.length) rows.push(cells);
-                i++;
-            }
-            if (rows.length) {
-                elements.push({
-                    tag: 'column_set',
-                    flex_mode: 'stretch',
-                    background_style: 'grey',
-                    columns: rows[0].map((_, idx) => ({
-                        tag: 'column',
-                        width: 'weighted',
-                        weight: 1,
-                        elements: rows.map(r => ({
-                            tag: 'div',
-                            text: { tag: 'lark_md', content: r[idx] || '' }
-                        }))
-                    }))
-                });
-            }
-            continue;
-        }
-        // 列表
-        else if (line.startsWith('- ') || line.startsWith('* ')) {
-            elements.push({ tag: 'div', text: { tag: 'lark_md', content: '• ' + line.substring(2) } });
-        }
-        // 引用
-        else if (line.startsWith('> ')) {
-            elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: line.substring(2) }] });
-        }
-        // 普通段落
-        else {
-            elements.push({ tag: 'div', text: { tag: 'lark_md', content: line } });
-        }
-        i++;
+    if (state.thinking && state.thinking.trim()) {
+        elements.push({
+            tag: 'div',
+            text: { tag: 'lark_md', content: `💭 **思考**\n> ${state.thinking.substring(0, 1000)}` }
+        });
     }
 
-    return elements;
+    if (state.toolCalls && state.toolCalls.length > 0) {
+        elements.push({
+            tag: 'div',
+            text: { tag: 'lark_md', content: state.toolCalls.map(tc => `🔧 **${tc.name}**`).join('\n') }
+        });
+    }
+
+    if (state.message && state.message.trim()) {
+        elements.push({
+            tag: 'div',
+            text: { tag: 'lark_md', content: state.message.substring(0, 2000) }
+        });
+    }
+
+    if (elements.length === 0) {
+        elements.push({ tag: 'div', text: { tag: 'plain_text', content: '⏳ 处理中...' } });
+    }
+
+    const card = {
+        header: {
+            template: 'green',
+            title: { tag: 'plain_text', content: '🤖 Kimi' }
+        },
+        elements
+    };
+
+    try {
+        // 尝试更新现有消息
+        if (messageId) {
+            const resp = await client.im.v1.message.patch({
+                data: { content: JSON.stringify(card) } as any,
+                path: { message_id: messageId },
+            });
+            if (resp.code === 0) {
+                return messageId;
+            }
+        }
+
+        // 失败则发送新消息
+        const resp = await client.im.v1.message.create({
+            params: { receive_id_type: 'open_id' },
+            data: {
+                receive_id: receiveId,
+                msg_type: 'interactive',
+                content: JSON.stringify(card),
+            } as any,
+        });
+        return resp.data?.message_id || null;
+    } catch (e) {
+        console.error('[Feishu] updateStreamCard error:', e);
+        return null;
+    }
+}
+
+// ============ 兼容旧接口 ============
+
+export async function sendStructuredCard(
+    _client: lark.Client,
+    receiveId: string,
+    title: string,
+    content: string,
+    thinking?: string
+): Promise<string | null> {
+    console.warn('[deprecated] sendStructuredCard is deprecated, use sendFinalCard instead');
+    await sendFinalCard(receiveId, title, content, { thought: thinking });
+    return null;
 }

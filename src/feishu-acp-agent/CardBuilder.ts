@@ -365,12 +365,12 @@ export function buildProgressCard(data: {
       const formattedThought = thought.length > 300 
         ? thought.substring(0, 300) + '...' 
         : thought;
-      thoughtContent += `💭 **思考过程**\n${formattedThought}\n\n`;
+      thoughtContent += `**思考过程**\n${formattedThought}\n\n`;
     }
 
     // 工具调用列表
     if (toolCalls.length > 0) {
-      thoughtContent += `🔧 **工具调用** (${toolCalls.length} 个)\n\n`;
+      thoughtContent += `**工具调用** (${toolCalls.length} 个)\n\n`;
       toolCalls.forEach((tc, i) => {
         thoughtContent += `${i + 1}. **${tc.name}**`;
         if (tc.params && Object.keys(tc.params).length > 0) {

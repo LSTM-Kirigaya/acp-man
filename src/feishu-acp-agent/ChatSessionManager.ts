@@ -510,13 +510,13 @@ export class ChatSessionManager extends EventEmitter {
     console.log('│  📥 Kimi ACP 回复                                       │');
     console.log('├─────────────────────────────────────────────────────────┤');
     if (progress.thought) {
-      console.log(`│  💭 思考过程: ${progress.thought.substring(0, 40).padEnd(40)} │`);
+      console.log(`│  思考过程: ${progress.thought.substring(0, 40).padEnd(40)} │`);
     }
     if (progress.toolCalls.length > 0) {
-      console.log(`│  🔧 工具调用: ${progress.toolCalls.length} 个`.padEnd(56) + '│');
+      console.log(`│  工具调用: ${progress.toolCalls.length} 个`.padEnd(56) + '│');
     }
-    console.log(`│  📊 历史轮次: ${session.messageHistory.length} 轮`.padEnd(56) + '│');
-    console.log(`│  ✂️  截取后长度: ${actualResponse.length}/${progress.message.length} chars`.padEnd(56) + '│');
+    console.log(`│  历史轮次: ${session.messageHistory.length} 轮`.padEnd(56) + '│');
+    console.log(`│  截取后长度: ${actualResponse.length}/${progress.message.length} chars`.padEnd(56) + '│');
     const responseLines = actualResponse.split('\n').slice(0, 5);
     for (const line of responseLines) {
       console.log(`│  ${line.substring(0, 53).padEnd(53)} │`);
