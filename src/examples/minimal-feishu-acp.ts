@@ -1,5 +1,5 @@
 /**
- * 飞书 ACP Agent - 修复并发重复问题
+ * 飞书 ACP Agent - 支持表情反应和环境变量控制
  */
 
 import * as dotenv from 'dotenv';
@@ -19,6 +19,8 @@ import {
     initFeishuClient,
     sendTextCard,
     sendFinalCard,
+    addReaction,
+    removeReaction,
 } from '../feishu-messaging.js';
 
 dotenv.config();
@@ -26,21 +28,29 @@ dotenv.config();
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID;
 const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET;
 const WORK_PATH = process.env.ACP_DEFAULT_CWD || process.cwd();
+const SHOW_THINKING_TOOL = process.env.SHOW_THINKING_TOOL || 'force'; // force, summary, detailed
 
 if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
     console.error('❌ 缺少环境变量');
     process.exit(1);
 }
 
+// 判断是否需要显示思考和工具调用
+const shouldShowThinking = SHOW_THINKING_TOOL !== 'force';
+const shouldShowTools = SHOW_THINKING_TOOL === 'detailed';
+
+console.log(`[Config] SHOW_THINKING_TOOL=${SHOW_THINKING_TOOL}, 显示思考=${shouldShowThinking}, 显示工具=${shouldShowTools}`);
+
 // ============ Session 状态 ============
 interface SessionState {
     sessionId: string;
     receiverId: string;
+    messageId: string;  // 用户消息ID，用于添加/删除表情
+    reactionId: string | null;  // 表情反应ID
     thinkingBuffer: string;
     messageBuffer: string;
     sentToolIds: Set<string>;
     phase: 'thinking' | 'tool' | 'message';
-    // 防重入锁
     isFlushingThinking: boolean;
 }
 
@@ -82,7 +92,7 @@ class AcpClient implements Client {
 
         switch (updateType) {
             case 'agent_thought_chunk':
-                if (content) {
+                if (content && shouldShowThinking) {
                     state.phase = 'thinking';
                     state.thinkingBuffer += content;
                 }
@@ -90,7 +100,9 @@ class AcpClient implements Client {
 
             case 'tool_call':
                 console.log('\n[RAW TOOL_CALL]', JSON.stringify(notification.update, null, 2).substring(0, 600));
-                await this.handleToolCall(state, notification);
+                if (shouldShowTools) {
+                    await this.handleToolCall(state, notification);
+                }
                 break;
 
             case 'agent_message_chunk':
@@ -113,11 +125,9 @@ class AcpClient implements Client {
 
         const toolName = update.title || 'Unknown';
         
-        // 尝试所有可能的参数字段
         const params = update.input || update.parameters || update.params || 
                       update.arguments || update.args || update.data || {};
         
-        // 如果没找到，尝试从 content 解析（有些协议把参数放 content 里）
         let finalParams = params;
         if (Object.keys(params).length === 0 && update.content) {
             try {
@@ -144,6 +154,8 @@ class AcpClient implements Client {
     }
 
     private async flushThinking(state: SessionState): Promise<void> {
+        if (!shouldShowThinking) return;
+        
         // 加锁：防止并发重复 flush
         if (state.isFlushingThinking) {
             console.log('[Flush] Already flushing, skip');
@@ -176,10 +188,12 @@ class AcpClient implements Client {
     async sendMessageStream(
         sessionId: string,
         prompt: string,
-        receiverId: string
+        receiverId: string,
+        messageId: string  // 用户消息ID，用于表情反应
     ): Promise<string> {
         const state: SessionState = {
-            sessionId, receiverId,
+            sessionId, receiverId, messageId,
+            reactionId: null,
             thinkingBuffer: '', messageBuffer: '',
             sentToolIds: new Set(),
             phase: 'message',
@@ -220,13 +234,26 @@ async function main() {
 
             const senderId = data.sender.sender_id.open_id;
             const content = JSON.parse(message.content).text;
+            const messageId = message.message_id;
 
             console.log(`\n[User] ${content}`);
+            console.log(`[MessageId] ${messageId}`);
 
-            const sessionId = await acp.newSession();
-            const reply = await acp.sendMessageStream(sessionId, content, senderId);
+            // 1. 添加"输入中"表情反应
+            const reactionId = await addReaction(messageId, 'KEY');
 
-            await sendFinalCard(senderId, '回复', reply);
+            try {
+                const sessionId = await acp.newSession();
+                const reply = await acp.sendMessageStream(sessionId, content, senderId, messageId);
+
+                // 2. 发送最终回复
+                await sendFinalCard(senderId, '回复', reply);
+            } finally {
+                // 3. 删除表情反应（无论成功失败都删除）
+                if (reactionId) {
+                    await removeReaction(messageId, reactionId);
+                }
+            }
         },
         'im.message.message_read_v1': async () => {},
     });

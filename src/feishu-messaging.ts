@@ -31,15 +31,16 @@ export async function sendTextCard(
 ): Promise<void> {
     const client = getClient();
     
+    // 使用 Markdown 解析为卡片元素
+    const contentElements = parseMarkdownToCardElements(content || '*(无内容)*');
+    
     const card = {
+        config: { wide_screen_mode: true },
         header: {
             template: 'green',
             title: { tag: 'plain_text', content: title }
         },
-        elements: [{
-            tag: 'div',
-            text: { tag: 'lark_md', content: content || '*(无内容)*' }
-        }]
+        elements: contentElements
     };
 
     try {
@@ -57,6 +58,157 @@ export async function sendTextCard(
     } catch (e) {
         console.error('[Feishu] sendTextCard error:', e);
     }
+}
+
+/**
+ * 将 Markdown 解析为飞书卡片元素
+ */
+function parseMarkdownToCardElements(markdown: string): any[] {
+    const elements: any[] = [];
+    const lines = markdown.split('\n');
+    let i = 0;
+
+    while (i < lines.length) {
+        const line = lines[i].trim();
+
+        if (line === '') {
+            i++;
+            continue;
+        }
+
+        // 一级标题 # Title
+        if (line.startsWith('# ') && !line.startsWith('## ')) {
+            elements.push({
+                tag: 'div',
+                text: {
+                    tag: 'plain_text',
+                    content: line.substring(2),
+                },
+            });
+            i++;
+            continue;
+        }
+
+        // 二级标题 ## Title
+        if (line.startsWith('## ') && !line.startsWith('### ')) {
+            elements.push({
+                tag: 'div',
+                text: {
+                    tag: 'plain_text',
+                    content: line.substring(3),
+                },
+            });
+            i++;
+            continue;
+        }
+
+        // 三级标题 ### Title
+        if (line.startsWith('### ')) {
+            elements.push({
+                tag: 'div',
+                text: {
+                    tag: 'plain_text',
+                    content: line.substring(4),
+                },
+            });
+            i++;
+            continue;
+        }
+
+        // 表格处理
+        if (line.includes('|')) {
+            const tableLines: string[][] = [];
+            while (i < lines.length && lines[i].trim().includes('|')) {
+                const row = lines[i].trim();
+                if (!row.match(/^\|[-:\s|]+\|$/)) {
+                    const cells = row.split('|').map(c => c.trim()).filter(c => c);
+                    if (cells.length > 0) {
+                        tableLines.push(cells);
+                    }
+                }
+                i++;
+            }
+
+            if (tableLines.length > 0) {
+                // 使用 column_set 实现表格
+                const columns = tableLines[0].map((_, colIndex) => ({
+                    tag: 'column',
+                    width: 'weighted',
+                    weight: 1,
+                    elements: tableLines.map(row => ({
+                        tag: 'div',
+                        text: {
+                            tag: 'lark_md',
+                            content: row[colIndex] || '',
+                        },
+                    })),
+                }));
+
+                elements.push({
+                    tag: 'column_set',
+                    flex_mode: 'stretch',
+                    background_style: 'grey',
+                    columns,
+                });
+            }
+            continue;
+        }
+
+        // 列表项
+        if (line.startsWith('- ') || line.startsWith('* ')) {
+            const listItems: any[] = [];
+            while (i < lines.length) {
+                const itemLine = lines[i].trim();
+                if (!itemLine.startsWith('- ') && !itemLine.startsWith('* ')) break;
+
+                const itemText = itemLine.substring(2);
+                listItems.push({
+                    tag: 'div',
+                    text: {
+                        tag: 'lark_md',
+                        content: '• ' + itemText,
+                    },
+                });
+                i++;
+            }
+            elements.push(...listItems);
+            continue;
+        }
+
+        // 引用
+        if (line.startsWith('> ')) {
+            elements.push({
+                tag: 'note',
+                elements: [
+                    {
+                        tag: 'plain_text',
+                        content: line.substring(2),
+                    },
+                ],
+            });
+            i++;
+            continue;
+        }
+
+        // 分割线
+        if (line === '---' || line === '***') {
+            elements.push({ tag: 'hr' });
+            i++;
+            continue;
+        }
+
+        // 普通段落（使用 lark_md 支持粗体）
+        elements.push({
+            tag: 'div',
+            text: {
+                tag: 'lark_md',
+                content: line,
+            },
+        });
+        i++;
+    }
+
+    return elements;
 }
 
 /**
@@ -95,13 +247,12 @@ export async function sendFinalCard(
         elements.push({ tag: 'hr' });
     }
 
-    // 最终回复内容
-    elements.push({
-        tag: 'div',
-        text: { tag: 'lark_md', content: content || '*(无回复内容)*' }
-    });
+    // 最终回复内容 - 使用 Markdown 解析为卡片元素
+    const contentElements = parseMarkdownToCardElements(content || '*(无回复内容)*');
+    elements.push(...contentElements);
 
     const card = {
+        config: { wide_screen_mode: true },
         header: {
             template: 'blue',
             title: { tag: 'plain_text', content: title }
@@ -259,6 +410,63 @@ export async function updateStreamCard(
     } catch (e) {
         console.error('[Feishu] updateStreamCard error:', e);
         return null;
+    }
+}
+
+// ============ 表情反应 (Reaction) ============
+
+/**
+ * 添加消息表情回复
+ * @param messageId 消息ID
+ * @param emojiType 表情类型，如 'KEY' (键盘/输入中), 'THUMBSUP', 'HEART' 等
+ * @returns reaction_id 用于后续删除
+ */
+export async function addReaction(messageId: string, emojiType: string): Promise<string | null> {
+    const client = getClient();
+    
+    try {
+        const resp = await client.im.messageReaction.create({
+            path: { message_id: messageId },
+            data: {
+                reaction_type: { emoji_type: emojiType }
+            }
+        });
+        
+        if (resp.code === 0 && resp.data?.reaction_id) {
+            console.log(`[Reaction] Added ${emojiType} to ${messageId.substring(0, 20)}...`);
+            return resp.data.reaction_id;
+        } else {
+            console.error('[Reaction] Failed to add:', resp.msg);
+        }
+    } catch (e) {
+        console.error('[Reaction] Add error:', e);
+    }
+    return null;
+}
+
+/**
+ * 删除消息表情回复
+ * @param messageId 消息ID
+ * @param reactionId 表情回复ID
+ */
+export async function removeReaction(messageId: string, reactionId: string): Promise<void> {
+    const client = getClient();
+    
+    try {
+        const resp = await client.im.messageReaction.delete({
+            path: { 
+                message_id: messageId,
+                reaction_id: reactionId
+            }
+        });
+        
+        if (resp.code === 0) {
+            console.log(`[Reaction] Removed from ${messageId.substring(0, 20)}...`);
+        } else {
+            console.error('[Reaction] Failed to remove:', resp.msg);
+        }
+    } catch (e) {
+        console.error('[Reaction] Remove error:', e);
     }
 }
 
