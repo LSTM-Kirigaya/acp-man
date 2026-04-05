@@ -103,15 +103,12 @@ function parseMarkdownToCardElements(markdown: string): any[] {
             }
 
             if (codeLines.length > 0) {
-                // 使用 lark_md 的代码块语法，飞书会渲染为带语法高亮的代码块
+                // 使用 tag: markdown 组件，支持代码块语法高亮
                 const normalizedLang = normalizeLanguage(language);
                 const codeContent = codeLines.join('\n');
                 elements.push({
-                    tag: 'div',
-                    text: {
-                        tag: 'lark_md',
-                        content: '```' + normalizedLang + '\n' + codeContent + '\n```',
-                    },
+                    tag: 'markdown',
+                    content: '```' + normalizedLang + '\n' + codeContent + '\n```',
                 });
             }
             continue;
