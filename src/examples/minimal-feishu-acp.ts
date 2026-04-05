@@ -1,6 +1,6 @@
 /**
- * 飞书 ACP Agent - 精简版
- * 使用 feishu-messaging 模块发送消息
+ * 飞书 ACP Agent - 精简版（实时流式输出）
+ * 思考过程和工具调用实时发送到飞书
  */
 
 import * as dotenv from 'dotenv';
@@ -20,8 +20,9 @@ import { spawn } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import {
     initFeishuClient,
-    sendPostMessage,
-    sendStructuredCard,
+    sendThinkingCard,
+    sendToolCallCard,
+    sendFinalCard,
 } from '../feishu-messaging.js';
 
 dotenv.config();
@@ -51,11 +52,11 @@ interface ChatSession {
     acpSessionId: string;
     messageHistory: MessageHistory[];
     lastActivity: number;
-}
-
-interface ThinkingProcess {
-    thought: string;
+    // 实时发送相关
+    currentReceiverId?: string;
+    thinkingBuffer: string;
     toolCalls: ToolCallInfo[];
+    messageId?: string;  // 用于更新卡片
 }
 
 interface ToolCallInfo {
@@ -65,15 +66,15 @@ interface ToolCallInfo {
     timestamp: number;
 }
 
-// ============ ACP 客户端 ============
+// 消息发送回调类型
+type MessageSender = (content: string, isThinking?: boolean) => Promise<void>;
+
+// ============ ACP 客户端（实时流式版） ============
 
 class AcpClient implements Client {
     private connection?: ClientSideConnection;
-    private streamCollector?: {
-        onMessageChunk: (c: string) => void;
-        onThoughtChunk?: (c: string) => void;
-        onToolCall?: (tool: ToolCallInfo) => void;
-    };
+    private currentSender?: MessageSender;
+    private thinkingTimeout?: NodeJS.Timeout;
 
     async connect(agentPath: string = 'kimi') {
         const childProcess = spawn(agentPath, ['acp'], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -88,6 +89,13 @@ class AcpClient implements Client {
             clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
         });
         console.log('[ACP] Connected');
+    }
+
+    /**
+     * 设置消息发送回调
+     */
+    setMessageSender(sender: MessageSender) {
+        this.currentSender = sender;
     }
 
     async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -113,41 +121,88 @@ class AcpClient implements Client {
                 content?: { text?: string };
             };
         };
-        const sessionId = notification.sessionId;
         const updateType = notification.update?.sessionUpdate;
         const content = notification.update?.content;
 
-        if (!sessionId || !updateType) return;
+        if (!updateType) return;
 
         switch (updateType) {
             case 'agent_message_chunk':
-                if (content?.text) {
-                    this.streamCollector?.onMessageChunk(content.text);
-                }
+                // 最终回复片段，不在这里处理
                 break;
+
             case 'agent_thought_chunk':
-                if (content?.text) {
-                    console.log(`[ACP] 💭 Thought: ${content.text.substring(0, 100)}${content.text.length > 100 ? '...' : ''}`);
-                    this.streamCollector?.onThoughtChunk?.(content.text);
+                if (content?.text && this.currentSender) {
+                    // 累积思考内容，延迟发送（避免过于频繁）
+                    this.bufferThinking(content.text);
                 }
                 break;
+
             case 'tool_call':
+                // 立即发送工具调用
                 const toolCall = this.parseToolCall(notification);
-                console.log(`[ACP] 🔧 Tool call: ${toolCall.name}`);
-                if (toolCall.params) {
-                    console.log(`[ACP]    Params:`, JSON.stringify(toolCall.params).substring(0, 200));
+                console.log('[ACP] 🔧 Tool call:', JSON.stringify({
+                    name: toolCall.name,
+                    params: toolCall.params,
+                    raw: notification  // 打印完整信息用于调试
+                }, null, 2));
+                
+                if (this.currentSender) {
+                    const toolText = `🔧 **${toolCall.name}**\n\`${JSON.stringify(toolCall.params || {}).substring(0, 200)}\``;
+                    await this.currentSender(toolText, true);
                 }
-                this.streamCollector?.onToolCall?.(toolCall);
                 break;
         }
     }
 
+    /**
+     * 缓冲思考内容，定期发送
+     */
+    private bufferThinking(text: string) {
+        // 清除之前的定时器
+        if (this.thinkingTimeout) {
+            clearTimeout(this.thinkingTimeout);
+        }
+
+        // 累积一定时间后发送
+        this.thinkingTimeout = setTimeout(async () => {
+            if (this.currentSender && text.trim()) {
+                await this.currentSender(`💭 ${text.trim()}`, true);
+            }
+        }, 500); // 500ms 延迟，合并短片段
+    }
+
+    /**
+     * 解析工具调用 - 打印完整字段用于调试
+     */
     private parseToolCall(notification: any): ToolCallInfo {
-        const tc = notification.toolCall || notification;
+        // 打印完整通知结构用于调试
+        console.log('[ACP] 🔍 Raw tool_call notification:', JSON.stringify(notification, null, 2));
+
+        // 尝试多种可能的字段路径
+        const toolCall = notification.toolCall || notification;
+        
+        // 尝试获取名称的各种可能字段
+        const name = toolCall.title || 
+                     toolCall.name || 
+                     toolCall.function?.name ||
+                     toolCall.command ||
+                     toolCall.tool ||
+                     'Unknown Tool';
+
+        // 尝试获取参数的各种可能字段
+        const params = notification.params || 
+                      toolCall.params || 
+                      toolCall.arguments ||
+                      toolCall.args ||
+                      toolCall.parameters ||
+                      toolCall.input ||
+                      {};
+
         return {
-            name: tc.title || tc.name || 'Unknown Tool',
-            params: notification.params || tc.params,
-            result: notification.result || tc.result,
+            name,
+            params,
+            result: notification.result || toolCall.result,
             timestamp: Date.now(),
         };
     }
@@ -161,23 +216,19 @@ class AcpClient implements Client {
         return response.sessionId;
     }
 
-    async sendMessageStream(sessionId: string, prompt: string): Promise<{ message: string; thinking: ThinkingProcess }> {
+    /**
+     * 流式发送消息，通过回调实时返回内容
+     */
+    async sendMessageStream(
+        sessionId: string, 
+        prompt: string,
+        onContent: (type: 'thinking' | 'tool' | 'message', content: string) => Promise<void>
+    ): Promise<string> {
         let fullMessage = '';
-        const thinking: ThinkingProcess = {
-            thought: '',
-            toolCalls: [],
-        };
 
-        this.streamCollector = {
-            onMessageChunk: (chunk: string) => {
-                fullMessage += chunk;
-            },
-            onThoughtChunk: (chunk: string) => {
-                thinking.thought += chunk;
-            },
-            onToolCall: (tool: ToolCallInfo) => {
-                thinking.toolCalls.push(tool);
-            },
+        // 设置回调
+        this.currentSender = async (content: string, isThinking?: boolean) => {
+            await onContent(isThinking ? 'thinking' : 'message', content);
         };
 
         const request: PromptRequest = {
@@ -185,23 +236,27 @@ class AcpClient implements Client {
             prompt: [{ type: 'text', text: prompt }],
         };
 
-        console.log('[ACP] ⏳ Waiting for response...');
+        console.log('[ACP] ⏳ Streaming response...');
         await this.connection!.prompt(request);
-        this.streamCollector = undefined;
+        
+        // 清除回调和定时器
+        this.currentSender = undefined;
+        if (this.thinkingTimeout) {
+            clearTimeout(this.thinkingTimeout);
+            this.thinkingTimeout = undefined;
+        }
 
-        return { message: fullMessage, thinking };
+        return fullMessage;
     }
 }
 
 // ============ 主程序 ============
 
 async function main() {
-    // 1. 连接 ACP
     const agentPath = process.env.ACP_AGENT_PATH || 'kimi';
     const acp = new AcpClient();
     await acp.connect(agentPath);
 
-    // 2. 初始化飞书客户端
     initFeishuClient(FEISHU_APP_ID!, FEISHU_APP_SECRET!);
     console.log('[Feishu] Client initialized');
 
@@ -240,13 +295,11 @@ async function main() {
 
                 // 消息去重
                 if (processedMessageIds.has(messageId)) {
-                    console.log(`[Feishu] ⚠️ Duplicate message ignored`);
                     return;
                 }
                 processedMessageIds.add(messageId);
 
-                console.log(`\n${'='.repeat(50)}`);
-                console.log(`[Feishu] 👤 User: ${content.substring(0, 50)}`);
+                console.log(`\n[Feishu] 👤 ${content.substring(0, 50)}`);
 
                 // 获取或创建会话
                 let session = sessions.get(chatId);
@@ -256,43 +309,61 @@ async function main() {
                         acpSessionId,
                         messageHistory: [],
                         lastActivity: Date.now(),
+                        currentReceiverId: senderId,
+                        thinkingBuffer: '',
+                        toolCalls: [],
                     };
                     sessions.set(chatId, session);
-                    console.log(`[ACP] Session created: ${acpSessionId.substring(0, 16)}...`);
+                    console.log(`[ACP] Session created`);
                 }
                 session.lastActivity = Date.now();
+                session.currentReceiverId = senderId;
 
                 // 计算内容偏移量
                 const contentOffset = session.messageHistory.reduce(
                     (sum, h) => sum + h.contentLength, 0
                 );
-                console.log(`[Offset] Rounds: ${session.messageHistory.length}, Offset: ${contentOffset}`);
 
-                // 发送到 ACP
-                console.log(`[ACP] Sending: ${content.substring(0, 50)}...`);
-                const { message: fullReply, thinking } = await acp.sendMessageStream(session.acpSessionId, content);
+                // 实时消息发送器
+                let lastMessageId: string | undefined;
+                
+                const sendRealTimeMessage = async (type: 'thinking' | 'tool' | 'message', text: string) => {
+                    try {
+                        if (type === 'thinking') {
+                            // 更新思考卡片
+                            session!.thinkingBuffer += text + '\n';
+                            lastMessageId = await sendThinkingCard(senderId, session!.thinkingBuffer, lastMessageId);
+                        } else if (type === 'tool') {
+                            // 添加工具调用到列表
+                            session!.toolCalls.push({
+                                name: text.split('\n')[0].replace('🔧 **', '').replace('**', ''),
+                                params: {},
+                                timestamp: Date.now(),
+                            });
+                            lastMessageId = await sendToolCallCard(senderId, text, lastMessageId);
+                        }
+                    } catch (err) {
+                        console.error('[Send Error]', err);
+                    }
+                };
 
-                console.log(`\n[ACP] 📊 Response Summary:`);
-                console.log(`  - Full length: ${fullReply.length} chars`);
-                console.log(`  - Thought length: ${thinking.thought.length} chars`);
-                console.log(`  - Tool calls: ${thinking.toolCalls.length}`);
+                // 发送到 ACP（实时流式）
+                const fullReply = await acp.sendMessageStream(
+                    session.acpSessionId, 
+                    content,
+                    sendRealTimeMessage
+                );
+
+                console.log(`[ACP] Full reply: ${fullReply.length} chars`);
 
                 // 偏移截取
                 let actualReply = fullReply;
                 if (contentOffset > 0 && fullReply.length > contentOffset) {
                     actualReply = fullReply.substring(contentOffset).trim();
-                    console.log(`[Offset] Sliced by offset: ${fullReply.length} -> ${actualReply.length}`);
-                } else if (session.messageHistory.length > 0) {
-                    const lastResponse = session.messageHistory[session.messageHistory.length - 1]?.aiActualResponse;
-                    if (lastResponse && fullReply.startsWith(lastResponse)) {
-                        actualReply = fullReply.substring(lastResponse.length).trim();
-                        console.log(`[Offset] Sliced by prefix: ${fullReply.length} -> ${actualReply.length}`);
-                    }
                 }
 
-                // 跳过空回复
                 if (!actualReply || actualReply.length === 0) {
-                    console.log(`[Feishu] ⚠️ Empty reply, skipping`);
+                    console.log(`[Feishu] ⚠️ Empty reply`);
                     return;
                 }
 
@@ -307,28 +378,24 @@ async function main() {
                     timestamp: Date.now(),
                 });
 
-                console.log(`[ACP] Actual reply: ${actualReply.substring(0, 80)}...`);
+                // 发送最终回复
+                await sendFinalCard(senderId, 'Kimi', actualReply, {
+                    thought: session.thinkingBuffer,
+                    toolCalls: session.toolCalls,
+                }, lastMessageId);
 
-                // ============ 使用 feishu-messaging 模块发送消息 ============
-                
-                // 方案1: 发送结构化卡片（推荐，支持 Markdown 渲染）
-                await sendStructuredCard(senderId, 'Kimi', actualReply, thinking);
-                console.log(`[Feishu] ✅ Structured card sent: ${actualReply.length} chars`);
+                // 清空缓冲
+                session.thinkingBuffer = '';
+                session.toolCalls = [];
 
-                // 备选方案: 如果需要简化格式，使用富文本
-                // await sendPostMessage(senderId, 'Kimi', actualReply);
-                // console.log(`[Feishu] ✅ Post message sent: ${actualReply.length} chars`);
-
-                console.log(`${'='.repeat(50)}\n`);
+                console.log(`[Feishu] ✅ Reply sent: ${actualReply.length} chars\n`);
 
             } catch (error) {
-                console.error('[Error] Failed to process message:', error);
+                console.error('[Error]', error);
             }
         },
 
-        'im.message.message_read_v1': async () => {
-            // 消除警告
-        },
+        'im.message.message_read_v1': async () => {},
     });
 
     const wsClient = new lark.WSClient({
@@ -337,7 +404,7 @@ async function main() {
     });
 
     await wsClient.start({ eventDispatcher });
-    console.log('[System] ✅ Ready for messages');
+    console.log('[System] ✅ Ready');
 }
 
 main().catch(console.error);
