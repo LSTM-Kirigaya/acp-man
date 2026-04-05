@@ -62,6 +62,15 @@ export async function sendTextCard(
 
 /**
  * 将 Markdown 解析为飞书卡片元素
+ * 
+ * 支持的格式：
+ * - 标题 (# ## ###)
+ * - 表格 (| col1 | col2 |)
+ * - 代码块 (```language\ncode\n```) - 使用飞书 code 组件，支持语法高亮
+ * - 列表 (- item, * item)
+ * - 引用 (> text)
+ * - 分割线 (---, ***)
+ * - 普通段落（支持 lark_md 内联格式：粗体、斜体、内联代码等）
  */
 function parseMarkdownToCardElements(markdown: string): any[] {
     const elements: any[] = [];
@@ -69,20 +78,47 @@ function parseMarkdownToCardElements(markdown: string): any[] {
     let i = 0;
 
     while (i < lines.length) {
-        const line = lines[i].trim();
+        const line = lines[i];
+        const trimmedLine = line.trim();
 
-        if (line === '') {
+        if (trimmedLine === '') {
             i++;
             continue;
         }
 
+        // 代码块处理 (```language\ncode\n```)
+        if (trimmedLine.startsWith('```')) {
+            const language = trimmedLine.substring(3).trim() || 'plain';
+            const codeLines: string[] = [];
+            i++; // 跳过开始的 ```
+            
+            while (i < lines.length) {
+                const codeLine = lines[i];
+                if (codeLine.trim() === '```') {
+                    i++; // 跳过结束的 ```
+                    break;
+                }
+                codeLines.push(codeLine);
+                i++;
+            }
+
+            if (codeLines.length > 0) {
+                elements.push({
+                    tag: 'code',
+                    language: normalizeLanguage(language),
+                    content: codeLines.join('\n'),
+                });
+            }
+            continue;
+        }
+
         // 一级标题 # Title
-        if (line.startsWith('# ') && !line.startsWith('## ')) {
+        if (trimmedLine.startsWith('# ') && !trimmedLine.startsWith('## ')) {
             elements.push({
                 tag: 'div',
                 text: {
                     tag: 'plain_text',
-                    content: line.substring(2),
+                    content: trimmedLine.substring(2),
                 },
             });
             i++;
@@ -90,12 +126,12 @@ function parseMarkdownToCardElements(markdown: string): any[] {
         }
 
         // 二级标题 ## Title
-        if (line.startsWith('## ') && !line.startsWith('### ')) {
+        if (trimmedLine.startsWith('## ') && !trimmedLine.startsWith('### ')) {
             elements.push({
                 tag: 'div',
                 text: {
                     tag: 'plain_text',
-                    content: line.substring(3),
+                    content: trimmedLine.substring(3),
                 },
             });
             i++;
@@ -103,12 +139,12 @@ function parseMarkdownToCardElements(markdown: string): any[] {
         }
 
         // 三级标题 ### Title
-        if (line.startsWith('### ')) {
+        if (trimmedLine.startsWith('### ')) {
             elements.push({
                 tag: 'div',
                 text: {
                     tag: 'plain_text',
-                    content: line.substring(4),
+                    content: trimmedLine.substring(4),
                 },
             });
             i++;
@@ -116,7 +152,7 @@ function parseMarkdownToCardElements(markdown: string): any[] {
         }
 
         // 表格处理
-        if (line.includes('|')) {
+        if (trimmedLine.includes('|')) {
             const tableLines: string[][] = [];
             while (i < lines.length && lines[i].trim().includes('|')) {
                 const row = lines[i].trim();
@@ -155,7 +191,7 @@ function parseMarkdownToCardElements(markdown: string): any[] {
         }
 
         // 列表项
-        if (line.startsWith('- ') || line.startsWith('* ')) {
+        if (trimmedLine.startsWith('- ') || trimmedLine.startsWith('* ')) {
             const listItems: any[] = [];
             while (i < lines.length) {
                 const itemLine = lines[i].trim();
@@ -176,13 +212,13 @@ function parseMarkdownToCardElements(markdown: string): any[] {
         }
 
         // 引用
-        if (line.startsWith('> ')) {
+        if (trimmedLine.startsWith('> ')) {
             elements.push({
                 tag: 'note',
                 elements: [
                     {
                         tag: 'plain_text',
-                        content: line.substring(2),
+                        content: trimmedLine.substring(2),
                     },
                 ],
             });
@@ -191,24 +227,56 @@ function parseMarkdownToCardElements(markdown: string): any[] {
         }
 
         // 分割线
-        if (line === '---' || line === '***') {
+        if (trimmedLine === '---' || trimmedLine === '***') {
             elements.push({ tag: 'hr' });
             i++;
             continue;
         }
 
-        // 普通段落（使用 lark_md 支持粗体）
+        // 普通段落（使用 lark_md 支持粗体、内联代码等）
         elements.push({
             tag: 'div',
             text: {
                 tag: 'lark_md',
-                content: line,
+                content: trimmedLine,
             },
         });
         i++;
     }
 
     return elements;
+}
+
+/**
+ * 标准化语言标识符
+ * 将各种语言别名转换为飞书支持的标准语言名称
+ */
+function normalizeLanguage(lang: string): string {
+    const languageMap: Record<string, string> = {
+        'js': 'javascript',
+        'ts': 'typescript',
+        'py': 'python',
+        'rb': 'ruby',
+        'sh': 'bash',
+        'shell': 'bash',
+        'zsh': 'bash',
+        'ps': 'powershell',
+        'ps1': 'powershell',
+        'c++': 'cpp',
+        'c#': 'csharp',
+        'cs': 'csharp',
+        'kt': 'kotlin',
+        'rs': 'rust',
+        'golang': 'go',
+        'yml': 'yaml',
+        'md': 'markdown',
+        'text': 'plain',
+        'txt': 'plain',
+        '': 'plain',
+    };
+
+    const normalized = lang.toLowerCase().trim();
+    return languageMap[normalized] || normalized || 'plain';
 }
 
 /**
